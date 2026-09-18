@@ -10,23 +10,28 @@ on:
 
 jobs:
   windows:
-    # windows-latest artık Visual Studio 18 ile geliyor ve node-gyp onu tanımıyor
-    # ("could not find a version of Visual Studio 2017 or newer").
-    # windows-2022 imajında VS 2022 var; better-sqlite3 burada sorunsuz derleniyor.
+    # windows-latest artık Visual Studio 18 ile geliyor ve node-gyp onu tanımıyor.
+    # windows-2022 imajında VS 2022 var; better-sqlite3 burada derlenebiliyor.
     runs-on: windows-2022
 
     env:
-      # node-gyp'a hangi Visual Studio'yu kullanacağını söyler.
-      # (npm config ile değil, ortam değişkeniyle verilir — npm 10 bunu
-      # geçersiz bir npm seçeneği sayıp hata veriyor.)
-      GYP_MSVS_VERSION: '2022'
+      GYP_MSVS_VERSION: '2022'   # node-gyp'a hangi VS'i kullanacağını söyler
 
     steps:
       - uses: actions/checkout@v4
 
+      # better-sqlite3@13 ve electron@44 Node 22 istiyor; Node 20'de uyarı
+      # verip eski node-gyp'a düşüyordu.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      # KRİTİK: Python 3.12'de 'distutils' kaldırıldı, node-gyp'ın kullandığı gyp
+      # betiği hâlâ onu arıyor ("ModuleNotFoundError: No module named 'distutils'").
+      # Python 3.11 bu modülü hâlâ içeriyor.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Bağımlılıkları kur
         run: npm install
