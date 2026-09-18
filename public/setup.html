@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Kasa Kurulumu — İlk Bağlantı</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0f1220; color:#eee;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  .card { width: 420px; background:#1a1e33; border-radius: 16px; padding: 32px; box-shadow: 0 20px 60px rgba(0,0,0,.4); }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  p.sub { color:#9aa0c3; font-size: 13px; margin: 0 0 24px; }
+  label { display:block; font-size: 13px; color:#b8bde0; margin: 14px 0 6px; }
+  input { width:100%; box-sizing:border-box; padding: 11px 12px; border-radius: 10px; border:1px solid #333a5c;
+          background:#12162a; color:#fff; font-size: 14px; outline:none; }
+  input:focus { border-color:#d4af37; }
+  button { width:100%; margin-top:24px; padding:12px; border:none; border-radius:10px; background:#d4af37;
+           color:#1a1a2e; font-weight:700; font-size:15px; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .status { margin-top:16px; font-size:13px; color:#9aa0c3; min-height:18px; white-space:pre-line; }
+  .error { color:#ff6b6b; }
+  .hint { margin-top:18px; font-size:12px; color:#6b7099; line-height:1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Kasa — İlk Bağlantı</h1>
+    <p class="sub">Sadece bir kere: restoranınızın online hesabıyla giriş yapın, verileriniz bu cihaza indirilsin. Sonrasında internet olmadan da çalışır.</p>
+
+    <label>Sunucu adresi</label>
+    <input id="serverUrl" placeholder="https://siteniz.com" autocomplete="off">
+
+    <label>E-posta</label>
+    <input id="email" type="email" placeholder="ornek@restoran.com" autocomplete="username">
+
+    <label>Şifre</label>
+    <input id="password" type="password" autocomplete="current-password">
+
+    <button id="btn">Bağlan ve İndir</button>
+    <div class="status" id="status"></div>
+    <div class="hint">İnternet bağlantısı bu ekranda gereklidir. Kurulum bittikten sonra program internetsiz açılabilir.</div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  $('btn').addEventListener('click', async () => {
+    const serverUrl = $('serverUrl').value.trim();
+    const email = $('email').value.trim();
+    const password = $('password').value;
+    if (!serverUrl || !email || !password) { $('status').textContent = 'Tüm alanları doldurun.'; $('status').className='status error'; return; }
+    $('btn').disabled = true;
+    $('status').className = 'status';
+    $('status').textContent = 'Bağlanılıyor...';
+    try {
+      window.setupAPI.onProgress((msg) => { $('status').textContent = msg; });
+      await window.setupAPI.bootstrap({ serverUrl, email, password });
+      $('status').textContent = 'Tamamlandı, açılıyor...';
+    } catch (e) {
+      $('status').className = 'status error';
+      $('status').textContent = 'Hata: ' + (e && e.message ? e.message : e);
+      $('btn').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

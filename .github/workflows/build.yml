@@ -1,0 +1,40 @@
+# Windows kurulum dosyası (.exe) üretir.
+# Kullanım: GitHub > Actions > "Build Windows" > Run workflow
+# Bittiğinde sayfanın altındaki "Artifacts" bölümünden Kasa-Setup.zip indirilir.
+name: Build Windows
+
+on:
+  workflow_dispatch:      # elle başlat
+  push:
+    tags: ['v*']          # v1.0.0 gibi bir etiket atınca da derler
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Bağımlılıkları kur
+        run: npm install
+
+      - name: Testleri çalıştır (gerçek Windows üzerinde)
+        run: npm test
+
+      - name: Native modülleri Electron için derle
+        run: npx electron-builder install-app-deps
+
+      - name: Windows kurulum dosyasını üret
+        run: npx electron-builder --win --x64 --publish never
+
+      - name: Çıktıyı yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kasa-Setup
+          path: |
+            dist_build/*.exe
+            dist_build/*.blockmap
+          if-no-files-found: error
