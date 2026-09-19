@@ -10,7 +10,10 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    # DİKKAT: windows-latest artık Visual Studio 18 taşıyor ve better-sqlite3'ün
+    # kullandığı node-gyp 9 bu sürümü tanımıyor ("could not find a version of
+    # Visual Studio 2017 or newer"). VS 2022 taşıyan imaja sabitliyoruz.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -24,14 +27,16 @@ jobs:
       - name: Bağımlılıkları kur
         run: npm install
         env:
-          # Hazır ikili varsa ASLA kaynaktan derleme (VS gerekmesin)
           npm_config_build_from_source: "false"
+          npm_config_msvs_version: "2022"
 
       - name: Testleri çalıştır (gerçek Windows üzerinde)
         run: npm test
 
       - name: Native modülleri Electron için derle
         run: npx electron-builder install-app-deps
+        env:
+          npm_config_msvs_version: "2022"
 
       - name: Windows kurulum dosyasını üret
         run: npx electron-builder --win --x64 --publish never
