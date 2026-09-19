@@ -16,10 +16,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # better-sqlite3 13 ve electron 44 Node 22 istiyor. Node 20'de hazır
+          # derlenmiş ikili indirilemiyor, kaynaktan derlemeye düşüyor ve
+          # runner'da Visual Studio bulunamadığı için kurulum patlıyordu.
+          node-version: 22
 
       - name: Bağımlılıkları kur
         run: npm install
+        env:
+          # Hazır ikili varsa ASLA kaynaktan derleme (VS gerekmesin)
+          npm_config_build_from_source: "false"
 
       - name: Testleri çalıştır (gerçek Windows üzerinde)
         run: npm test
