@@ -10,7 +10,10 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    # windows-latest artık Visual Studio 18 taşıyor; better-sqlite3'ün kullandığı
+    # node-gyp 9 bu sürümü tanımıyor ("could not find a version of Visual Studio
+    # 2017 or newer"). windows-2022 imajında VS2022 var ve node-gyp onu buluyor.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -19,17 +22,13 @@ jobs:
           # better-sqlite3 13 ve electron 44 Node 22 istiyor.
           node-version: 22
 
-      # ── KRİTİK ADIM ──────────────────────────────────────────────
-      # better-sqlite3 native bir modül; hazır ikili bulunamazsa node-gyp ile
-      # derleniyor. Runner'daki Visual Studio 18'i node-gyp 9 TANIMIYOR
-      # ("could not find a version of Visual Studio 2017 or newer") ve
-      # msvs_version ayarı da bunu çözmüyor — log'da "VCINSTALLDIR not set"
-      # satırı bunu söylüyor. Bu adım derleyici ortam değişkenlerini kurar;
-      # node-gyp o zaman sürüm arama aşamasını atlayıp hazır ortamı kullanır.
-      - name: MSVC derleyici ortamını kur
-        uses: ilammy/msvc-dev-cmd@v1
+      # node-gyp 9, Python'un distutils modülünü kullanıyor. Bu modül Python
+      # 3.12'de TAMAMEN KALDIRILDI ve derleme "ModuleNotFoundError: No module
+      # named 'distutils'" ile patlıyor. Runner'ın varsayılanı 3.12 olduğu için
+      # Python'u distutils'in hâlâ bulunduğu 3.11'e sabitliyoruz.
+      - uses: actions/setup-python@v5
         with:
-          arch: x64
+          python-version: '3.11'
 
       - name: Bağımlılıkları kur
         run: npm install
