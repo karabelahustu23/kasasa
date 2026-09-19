@@ -1,0 +1,68 @@
+{
+  "name": "eqeqe_electron",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "electron-builder install-app-deps || echo \"electron-rebuild atlandi (internet yoksa normal, ilk 'npm run start' oncesi internetli calistirin)\"",
+    "dist": "electron-builder",
+    "test": "node test/e2e.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "bootstrap-icons": "^1.13.1",
+    "express": "^5.2.1",
+    "jspdf": "^4.2.1",
+    "jszip": "^3.10.2",
+    "lucide": "^1.47.0",
+    "multer": "^2.4.0",
+    "qrcodejs": "^1.0.0"
+  },
+  "devDependencies": {
+    "electron": "^44.4.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.eqeqe.kasa",
+    "productName": "Kasa",
+    "files": [
+      "main.js",
+      "preload-setup.js",
+      "preload-main.js",
+      "server/**/*",
+      "public/**/*",
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "output": "dist_build"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Kasa"
+    }
+  }
+}
