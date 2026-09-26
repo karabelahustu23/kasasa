@@ -1129,7 +1129,7 @@ function applyOrders(db, orders, opts = {}) {
       const localOrderRow = db.prepare('SELECT * FROM orders WHERE id=?').get(localOrderId);
       const og = guardRegression(db, 'orders', o, localOrderRow);
       // Sunucuda ödenmiş sipariş kilitli: geri göndermeyi denemeyiz (400 alır)
-      if (og.regressed && !Number(o.is_paid)) requeueLocalAhead('orders', { ...localOrderRow, id: localOrderId });
+      if (og.regressed) requeueLocalAhead('orders', { ...localOrderRow, id: localOrderId });
       const orderChanged = upsertRow(db, 'orders', og.row);
       let itemsChanged = false;
 
@@ -1463,6 +1463,8 @@ async function pullRemoteUpdates({ force = false } = {}) {
     }
 
     if (healTableStatuses()) touched.add('tables');
+    // Başka cihazlardan (garson telefonu, QR menü) gelen kalemler için mutfak fişi
+    try { require('./printjobs').schedule(); } catch (e) {}
     H.cfgSet('last_incremental_sync', new Date().toISOString());
     state.online = true;
     state.lastPullAt = new Date().toISOString();
