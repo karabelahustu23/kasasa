@@ -25,6 +25,9 @@ function wrap(fn) {
       if (res.statusCode < 400) {
         // Başarılı yazma: offline-sync kuyruğuna ekle + arayüzlere anlık olay yayınla
         enqueueIfWrite(req, captured);
+        if (['orders', 'tables', 'order_items'].includes(req.query.table) && req.method !== 'GET') {
+          try { if (require('./sync').healTableStatuses()) E.publish && req.query.restaurant_id && E.publish(req.query.restaurant_id, 'table_update', {}); } catch (e) {}
+        }
         emitRealtime(req, captured);
       }
     } catch (e) {
@@ -502,10 +505,9 @@ router.all('/api/index.php', wrap((req, res) => {
       const origItems = db.prepare('SELECT product_id, product_name, variant_name, quantity, price FROM order_items WHERE order_id=?').all(body.order_id);
       const newId = body.new_order_id || H.uuid();
       body.new_order_id = newId; // sunucu da aynı id'yi kullansın
-      const vatInfo = H.getRestaurantVat(order.restaurant_id);
-      let subtotal = 0; for (const it of origItems) subtotal += Number(it.price) * Number(it.quantity);
-      const vatAmt = vatInfo.enabled ? Math.round(subtotal * (vatInfo.rate / 100) * 100) / 100 : 0;
-      const newTotal = Math.round((subtotal + vatAmt) * 100) / 100;
+      const calcV = H.computeTotals(order.restaurant_id, targetTableId, origItems, 0);
+      const vatAmt = calcV.vat_amount;
+      const newTotal = calcV.total;
       db.prepare(`INSERT INTO orders (id,restaurant_id,table_id,status,total,discount_amount,note,is_paid,vat_amount,employee_name,created_at) VALUES (?,?,?,?,?,0,?,0,?,?,?)`)
         .run(newId, order.restaurant_id, targetTableId || null, 'pending', newTotal, 'Düzeltme: iptal edilen siparişin yerine açıldı', vatAmt, order.employee_name, H.nowSql());
       if (origItems.length) {
@@ -596,14 +598,12 @@ router.all('/api/index.php', wrap((req, res) => {
         H.checkProductStockSufficiency(rid, body.order_items);
       }
       const discountAmt = Number(body.discount_amount || 0);
-      const vatInfo = H.getRestaurantVat(rid);
+      const vatInfo = H.getOrderVat(rid, body.table_id);
       let finalTotal, vatAmt;
       if (body.order_items && body.order_items.length) {
-        let subtotalCalc = 0;
-        for (const it of body.order_items) subtotalCalc += Number(it.price || 0) * Number(it.quantity || 0);
-        const afterDiscount = Math.max(0, subtotalCalc - discountAmt);
-        vatAmt = vatInfo.enabled ? Math.round(afterDiscount * (vatInfo.rate / 100) * 100) / 100 : 0;
-        finalTotal = Math.round((afterDiscount + vatAmt) * 100) / 100;
+        const calcP = H.computeTotals(rid, body.table_id, body.order_items, discountAmt);
+        vatAmt = calcP.vat_amount;
+        finalTotal = calcP.total;
       } else {
         const baseTotal = Number(body.total || 0);
         vatAmt = vatInfo.enabled ? Math.round(baseTotal * (vatInfo.rate / 100) * 100) / 100 : 0;
@@ -665,10 +665,20 @@ router.all('/api/index.php', wrap((req, res) => {
       const where = ['restaurant_id=?']; const wvals = [rid];
       if (req.query.table_id !== undefined) { where.push('table_id=?'); wvals.push(req.query.table_id); }
       if (req.query.neq_status !== undefined) { where.push('status!=?'); wvals.push(req.query.neq_status); }
+      // Eskiden is_paid filtresi YOK SAYILIYORDU: gün kapatma ödenmemiş açık
+      // siparişleri de "completed" yapıyordu.
+      if (req.query.is_paid !== undefined) { where.push('COALESCE(is_paid,0)=?'); wvals.push(Number(req.query.is_paid) ? 1 : 0); }
+      if (Array.isArray(body.ids) && body.ids.length) { where.push(`id IN (${body.ids.map(() => '?').join(',')})`); wvals.push(...body.ids); }
       if (req.query.status !== undefined) { const statuses = req.query.status.split(',').map(s => s.trim()); where.push(`status IN (${statuses.map(() => '?').join(',')})`); wvals.push(...statuses); }
-      const allowedFilterCols = ['id', 'created_at', 'updated_at', 'total', 'status'];
+      // paid_at eskiden izinli değildi → gün kapatma 2. kez yapıldığında 400 alıp
+      // hiçbir siparişi kapatamıyordu.
+      const allowedFilterCols = ['id', 'created_at', 'updated_at', 'total', 'status', 'paid_at'];
       for (const [k, v] of Object.entries(req.query)) {
-        if (k.startsWith('gt_')) { const col = k.slice(3); if (!allowedFilterCols.includes(col)) H.errorResponse('Geçersiz filtre alanı'); where.push(`${col}>?`); wvals.push(v); }
+        if (k.startsWith('gt_')) {
+          const col = k.slice(3); if (!allowedFilterCols.includes(col)) H.errorResponse('Geçersiz filtre alanı');
+          if (col === 'paid_at') { where.push('(paid_at>? OR (paid_at IS NULL AND created_at>?))'); const d = H.toMysqlDate(v); wvals.push(d, d); }
+          else { where.push(`${col}>?`); wvals.push(v); }
+        }
       }
       const whereSql = where.join(' AND ');
       if (payFields.length) db.prepare(`UPDATE orders SET ${payFields.join(',')} WHERE ${whereSql} AND (is_paid=0 OR is_paid IS NULL)`).run(...payValues, ...wvals);
