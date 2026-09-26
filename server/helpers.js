@@ -179,15 +179,50 @@ function getRestaurantVat(rid) {
   return { enabled, rate };
 }
 
+// Delivery (paket/teslimat) masası mı? (tables.is_takeaway=1) — bu siparişlerden KDV alınmaz.
+function isDeliveryTable(tableId) {
+  if (!tableId) return false;
+  const db = getDB();
+  const row = db.prepare('SELECT is_takeaway FROM tables WHERE id=?').get(tableId);
+  return !!(row && Number(row.is_takeaway) === 1);
+}
+
+// Sipariş/masa için geçerli KDV bilgisi: delivery ise KDV kapalı döner.
+function getOrderVat(rid, tableId) {
+  const vat = getRestaurantVat(rid);
+  if (isDeliveryTable(tableId)) return { enabled: false, rate: vat.rate };
+  return vat;
+}
+
+// Arayüzle (admin.html posCalculateTotals / renderTables) BİREBİR aynı kural:
+//  • total = kalemler toplamı + KDV   (indirim total'dan DÜŞÜLMEZ; arayüz her yerde
+//    "total - discount_amount" ile net tutarı hesaplıyor — düşülürse indirim 2 kez düşer)
+//  • KDV, vat_exempt OLMAYAN ürünler üzerinden, indirim oranlı dağıtılarak hesaplanır
+//  • Delivery masalarında KDV yok
+function computeTotals(rid, tableId, items, discountAmount = 0) {
+  const db = getDB();
+  const exemptStmt = db.prepare('SELECT vat_exempt FROM products WHERE id=?');
+  let subtotal = 0, vatable = 0;
+  for (const it of (items || [])) {
+    const line = Number(it.price || 0) * Number(it.quantity || 0);
+    subtotal += line;
+    const p = it.product_id ? exemptStmt.get(it.product_id) : null;
+    if (!(p && Number(p.vat_exempt) === 1)) vatable += line;
+  }
+  const discount = Math.min(Number(discountAmount || 0), subtotal);
+  const vatableAfterDiscount = subtotal > 0 ? vatable - discount * (vatable / subtotal) : 0;
+  const vat = getOrderVat(rid, tableId);
+  const vatAmount = (vat.enabled && vatableAfterDiscount > 0)
+    ? Math.round(vatableAfterDiscount * (vat.rate / 100) * 100) / 100 : 0;
+  const total = Math.round((subtotal + vatAmount) * 100) / 100;
+  return { subtotal, vat_amount: vatAmount, total };
+}
+
 function computeOrderTotalFromItems(rid, orderId, discountAmount = 0) {
   const db = getDB();
-  const s2 = db.prepare('SELECT SUM(price*quantity) AS t FROM order_items WHERE order_id=?').get(orderId);
-  const subtotal = Number(s2 && s2.t || 0);
-  const afterDiscount = Math.max(0, subtotal - Number(discountAmount || 0));
-  const vat = getRestaurantVat(rid);
-  const vatAmount = vat.enabled ? Math.round(afterDiscount * (vat.rate / 100) * 100) / 100 : 0;
-  const total = Math.round((afterDiscount + vatAmount) * 100) / 100;
-  return { subtotal, vat_amount: vatAmount, total };
+  const items = db.prepare('SELECT product_id, price, quantity FROM order_items WHERE order_id=?').all(orderId);
+  const ord = db.prepare('SELECT table_id FROM orders WHERE id=?').get(orderId);
+  return computeTotals(rid, ord && ord.table_id, items, discountAmount);
 }
 
 function checkRestaurantOpen(rid) {
@@ -434,7 +469,7 @@ module.exports = {
   uuid, nowSql, toMysqlDate, restaurantTz, ApiError, errorResponse,
   getAuthUser, requireAuth, requireAuthActive, requireSuperadmin, getMyRestaurantId,
   assertOwnsRow, assertOwnsRestaurant, resolveEntityId, resolveUserPermissions, publishEvent,
-  getRestaurantVat, computeOrderTotalFromItems, checkRestaurantOpen,
+  getRestaurantVat, isDeliveryTable, getOrderVat, computeTotals, computeOrderTotalFromItems, checkRestaurantOpen,
   checkRecipeStockSufficiency, checkProductStockSufficiency,
   deductRecipeStock, restoreRecipeStock, refreshProductAvailability, deductSimpleProductStock,
   cfgGet, cfgSet, bcrypt,
