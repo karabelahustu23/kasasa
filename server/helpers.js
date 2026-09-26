@@ -188,9 +188,9 @@ function isDeliveryTable(tableId) {
 }
 
 // Sipariş/masa için geçerli KDV bilgisi: delivery ise KDV kapalı döner.
-function getOrderVat(rid, tableId) {
+function getOrderVat(rid, tableId, deliveryCompany) {
   const vat = getRestaurantVat(rid);
-  if (isDeliveryTable(tableId)) return { enabled: false, rate: vat.rate };
+  if (isDeliveryTable(tableId) || (deliveryCompany && String(deliveryCompany).trim() !== '')) return { enabled: false, rate: vat.rate };
   return vat;
 }
 
@@ -199,7 +199,7 @@ function getOrderVat(rid, tableId) {
 //    "total - discount_amount" ile net tutarı hesaplıyor — düşülürse indirim 2 kez düşer)
 //  • KDV, vat_exempt OLMAYAN ürünler üzerinden, indirim oranlı dağıtılarak hesaplanır
 //  • Delivery masalarında KDV yok
-function computeTotals(rid, tableId, items, discountAmount = 0) {
+function computeTotals(rid, tableId, items, discountAmount = 0, deliveryCompany = null) {
   const db = getDB();
   const exemptStmt = db.prepare('SELECT vat_exempt FROM products WHERE id=?');
   let subtotal = 0, vatable = 0;
@@ -211,7 +211,7 @@ function computeTotals(rid, tableId, items, discountAmount = 0) {
   }
   const discount = Math.min(Number(discountAmount || 0), subtotal);
   const vatableAfterDiscount = subtotal > 0 ? vatable - discount * (vatable / subtotal) : 0;
-  const vat = getOrderVat(rid, tableId);
+  const vat = getOrderVat(rid, tableId, deliveryCompany);
   const vatAmount = (vat.enabled && vatableAfterDiscount > 0)
     ? Math.round(vatableAfterDiscount * (vat.rate / 100) * 100) / 100 : 0;
   const total = Math.round((subtotal + vatAmount) * 100) / 100;
@@ -221,8 +221,8 @@ function computeTotals(rid, tableId, items, discountAmount = 0) {
 function computeOrderTotalFromItems(rid, orderId, discountAmount = 0) {
   const db = getDB();
   const items = db.prepare('SELECT product_id, price, quantity FROM order_items WHERE order_id=?').all(orderId);
-  const ord = db.prepare('SELECT table_id FROM orders WHERE id=?').get(orderId);
-  return computeTotals(rid, ord && ord.table_id, items, discountAmount);
+  const ord = db.prepare('SELECT table_id, delivery_company FROM orders WHERE id=?').get(orderId);
+  return computeTotals(rid, ord && ord.table_id, items, discountAmount, ord && ord.delivery_company);
 }
 
 function checkRestaurantOpen(rid) {
