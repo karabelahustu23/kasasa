@@ -8026,7 +8026,7 @@ loadTablesAndOrders();
 async function addOneTable() {
 const { data: existingTablesRaw } = await sb.from('tables').select('number,is_takeaway').eq('restaurant_id', currentRestaurantId).order('number', { ascending: false });
 const existingTables = (existingTablesRaw || []).filter(tb => !tb.is_takeaway);
-const nextNumber = (existingTables?.length || 0) + 1;
+const nextNumber = existingTables.reduce((m, tb) => Math.max(m, Number(tb.number) || 0), 0) + 1;
 const { error } = await sb.from('tables').insert([{ number: nextNumber, status: 'empty', color: '#1a1a2e', restaurant_id: currentRestaurantId }]);
 if (error) { showToast(translations[currentLang].msg_logo_err + error.message); return; }
 showToast(translations[currentLang].msg_table_added);
@@ -8410,7 +8410,7 @@ groupClass = order.status === 'ready' ? 'ready' : order.status === 'preparing' ?
 // değeri taşıyabilir — bu yüzden burada doğru değeri kalemlerden yeniden hesaplayıp
 // kayıtlı değerle karşılaştırıyoruz; farklıysa arka planda sessizce düzeltiyoruz.
 if (!isOrderPaid) {
-  const _oVatEnabled = !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
+  const _oVatEnabled = !table.is_takeaway && !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
   const _oVatRate = parseFloat(currentSettings.vat_rate || 0);
   const _oDiscount = parseFloat(order.discount_amount || 0);
   let _oItemsSubtotal = 0, _oVatableSubtotal = 0;
@@ -8568,7 +8568,7 @@ ${actionButtons}
 </div>`;
 });
 const activeCount = tableOrders.filter(o => o.status !== 'served').length;
-const _vatEnabledForTable = !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
+const _vatEnabledForTable = !table.is_takeaway && !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
 const _vatRateForTable = parseFloat(currentSettings.vat_rate || 0);
 const _vatableAfterDiscountForTable = grandItemsSubtotal > 0 ? grandVatableSubtotal - (grandDiscount * (grandVatableSubtotal / grandItemsSubtotal)) : 0;
 const _vatAmountForTable = (_vatEnabledForTable && _vatableAfterDiscountForTable > 0) ? _vatableAfterDiscountForTable * _vatRateForTable / 100 : 0;
@@ -10907,7 +10907,8 @@ const now = new Date().toLocaleString(
 currentLang === 'tr' ? 'tr-TR' : currentLang === 'ru' ? 'ru-RU' : currentLang === 'ka' ? 'ka-GE' : 'en-US',
 { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }
 );
-const vatEnabled = !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
+const _rcpTable = (allTables || []).find(tb => tb.id === tableId);
+const vatEnabled = !(_rcpTable && _rcpTable.is_takeaway) && !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
 const vatRate = parseFloat(currentSettings.vat_rate || 0);
 const subtotal = grandTotal;
 // KDV'den muaf ürünler varsa, KDV yalnızca muaf OLMAYAN ürünlerin tutarı üzerinden hesaplanır
@@ -10999,16 +11000,24 @@ document.getElementById('printReceiptFrame').style.display = 'none';
 const tw = { tr:'Masa ', en:'Table ', ru:'Стол ', ka:'მაგიდა ' };
 // Bulk update: restaurant_id zorunlu (index.php satır 401)
 const token = localStorage.getItem('qr_token');
-const url = '/api/index.php?table=orders&restaurant_id=' + encodeURIComponent(currentRestaurantId) + '&table_id=' + encodeURIComponent(tableId);
+// ÖNEMLİ: "masadaki TÜM siparişleri kapat" toplu isteği KULLANILMIYOR. O istek
+// çevrimdışıyken kuyruğa girip sonradan sunucuda çalıştığında, arada müşterinin
+// QR'dan verdiği YENİ siparişi de ödenmiş/tamamlandı yapıyordu. Artık yalnızca
+// şu an kapatılan siparişler, id'leriyle tek tek kapatılıyor.
 let error = null;
 try {
-const res = await fetch(url, {
+const lr = await fetch('/api/index.php?table=orders&restaurant_id=' + encodeURIComponent(currentRestaurantId) + '&table_id=' + encodeURIComponent(tableId), { headers: { 'Authorization': 'Bearer ' + token } });
+const list = await lr.json();
+const openIds = (Array.isArray(list) ? list : []).filter(o => !Number(o.is_paid) && !o.voided_at && !['completed','cancelled'].includes(o.status)).map(o => o.id);
+const paidAt = new Date().toISOString();
+for (const oid of openIds) {
+const res = await fetch('/api/index.php?table=orders&id=' + encodeURIComponent(oid), {
 method: 'PUT',
 headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-body: JSON.stringify({ status: 'completed', is_paid: 1, payment_method: 'cash', paid_at: new Date().toISOString() })
+body: JSON.stringify({ status: 'completed', is_paid: 1, payment_method: 'cash', paid_at: paidAt })
 });
-const data = await res.json();
-if (!res.ok) error = data?.error || ('HTTP ' + res.status);
+if (!res.ok) { const d = await res.json().catch(() => ({})); error = d?.error || ('HTTP ' + res.status); break; }
+}
 } catch(e) { error = e.message; }
 // Masayı da empty yap
 if (!error) {
@@ -17729,7 +17738,8 @@ discountAmount = posDiscount.type === 'percent' ? subtotal * (posDiscount.value 
 discountAmount = Math.min(discountAmount, subtotal);
 }
 const afterDiscount = subtotal - discountAmount;
-const vatEnabled = !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
+// Delivery siparişlerinden KDV alınmaz
+const vatEnabled = !posIsDeliveryOrder && !!(currentSettings.vat_enabled == 1 || currentSettings.vat_enabled === true || currentSettings.vat_enabled === '1');
 const vatRate = parseFloat(currentSettings.vat_rate || 0);
 // KDV'den muaf ürünler varsa, KDV yalnızca muaf OLMAYAN ürünlerin tutarı üzerinden hesaplanır
 // (indirim, muaf/muaf-olmayan tutarlar arasında oranlı dağıtılır)
