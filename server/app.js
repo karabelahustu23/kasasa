@@ -9,6 +9,8 @@ const fs = require('fs');
 const H = require('./helpers');
 
 function createApp() {
+  // Mutfak fiş kuyruğu (tablolar + ilk kurulum + arka plan kontrolü)
+  try { require('./printjobs').init(); } catch (e) { console.error('[fiş] kuyruk başlatılamadı:', e); }
   const app = express();
   app.disable('x-powered-by');
   app.set('etag', false);
