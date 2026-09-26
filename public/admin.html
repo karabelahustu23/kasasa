@@ -15918,7 +15918,8 @@ async function kitchenItemPreparing(orderId, itemId) {
     await loadKitchenOrders();
     if (!isBusinessDayClosed) loadTablesAndOrders();
     // Hazırlanıyor'a geçince o item'ın istasyon fişini bas (ayardan açıksa)
-    if (itemId && currentSettings.kitchen_auto_print) _printTicketForItem(orderId, itemId);
+    if (itemId && currentSettings.kitchen_auto_print && !_pjActive()) _printTicketForItem(orderId, itemId);
+    if (_pjActive()) _pjKick();
   } catch(e) { showToast('Güncelleme hatası'); }
 }
 
@@ -17667,6 +17668,23 @@ if (queueCb) queueCb(product, qty);
 async function posChangeQty(index, delta) {
 const item = posCart[index];
 if (!item) return;
+// MUTFAĞA GÖNDERİLMİŞ bir satırda "+" basılırsa: eskiden aynı satırın adedi artırılıyordu
+// (ör. Xaçapuri 2 → 3). Satır zaten "gönderildi" olduğu için artan 1 adet için mutfağa
+// HİÇ fiş çıkmıyordu, masada ise ×3 görünüyordu. Artık artış YENİ bir satır olarak
+// eklenir; "Mutfağa Gönder" ile normal şekilde fişe basılır.
+if (delta > 0 && item.id && (item.sent_to_kitchen == 1 || item.sent_to_kitchen === true)) {
+  const same = posCart.find(i => (i._isNew || !i.id) && i.product_id === item.product_id
+    && (i.variant_id || null) === (item.variant_id || null) && i.product_name === item.product_name);
+  if (same) same.quantity += delta;
+  else posCart.push({
+    product_id: item.product_id, product_name: item.product_name,
+    variant_id: item.variant_id || null, variant_name: item.variant_name || null,
+    price: item.price, quantity: delta, _isNew: true
+  });
+  renderPosCart();
+  try { showToast('➕ Yeni satır eklendi — mutfağa göndermeyi unutmayın'); } catch (e) {}
+  return;
+}
 const newQty = item.quantity + delta;
 // Mevcut (DB'de kayıtlı) bir kalemin adedini azaltmak/silmek sipariş sayısını azaltır → PIN gerekir
 if (delta < 0 && item.id) {
@@ -22573,6 +22591,10 @@ function printKitchenTicket(orderId, itemId) {
 // Otomatik fişler basılmadan önce kalemler "sahiplenilir": aynı kalem ikinci kez
 // (başka pencere, yenileme, senkron sonrası tekrar görünme) otomatik basılmaz.
 async function autoPrintKitchenTicketsForOrder(order) {
+  // Masaüstü uygulamasında mutfak fişlerini SUNUCUDAKİ FİŞ KUYRUĞU üretir ve basar
+  // (bkz. server/printjobs.js + aşağıdaki yazdırma servisi). Ekranın tahminine dayalı
+  // eski yol yalnızca tarayıcı/site modunda çalışır.
+  if (_pjActive()) { _pjKick(); return; }
   let items = Array.isArray(order.order_items) ? order.order_items : [];
   const ids = items.map(i => i && i.id).filter(Boolean);
   if (ids.length) {
@@ -22627,6 +22649,7 @@ function _printNoStationItems(items, order) {
 }
 
 function _autoPrintKitchenItems(order) {
+  if (_pjActive()) { _pjKick(); return; }
   const stations = window._kitchenStations || [];
   const items = Array.isArray(order.order_items) ? order.order_items : [];
 
@@ -22736,6 +22759,9 @@ async function tableOrderPreparing(orderId) {
       body: JSON.stringify({ sent_to_kitchen: 1 })
     }).catch(function(){});
   });
+
+  // Masaüstünde fişi sunucu kuyruğu basar (kalemler "gönderildi" işaretlendiği an)
+  if (_pjActive()) { _pjKick(); return; }
 
   const stations = window._kitchenStations || [];
 
@@ -23383,7 +23409,8 @@ setInterval(function() {
 }, 5000);
 
 // Fişi oluştur ve doğru yazıcıya bas
-function _renderAndPrintKitchenFrame(items, order, stationName, printerName, paperWidthMm) {
+function _buildKitchenTicketHtml(items, order, stationName, opts) {
+  opts = opts || {};
   var lang = currentLang || 'tr';
   var locale = { tr:'tr-TR', en:'en-US', ru:'ru-RU', ka:'ka-GE' }[lang] || 'tr-TR';
   var lbl = {
@@ -23433,9 +23460,11 @@ function _renderAndPrintKitchenFrame(items, order, stationName, printerName, pap
     ? '<div style="text-align:center;font-size:13px;font-weight:900;letter-spacing:1px;border:2px solid #000;padding:3px 8px;display:inline-block;margin-bottom:6px">' + cleanStation + '</div><br>'
     : '';
 
-  var frame = document.getElementById('printReceiptFrame');
-  frame.innerHTML =
-    '<div style="font-family:monospace;font-size:14px;color:#000;padding:8px">'
+  var cancelHTML = opts.cancel ? '<div style="text-align:center;font-size:22px;font-weight:900;border:3px solid #000;padding:4px;margin:4px 0">*** IPTAL ***</div>' : '';
+  var reprintHTML = opts.reprint ? '<div style="text-align:center;font-size:12px;font-weight:900;margin:2px 0">(TEKRAR BASIM)</div>' : '';
+  var warnHTML = opts.warning ? '<div style="text-align:center;font-size:12px;font-weight:900;border:2px solid #000;padding:2px;margin:2px 0">' + opts.warning + '</div>' : '';
+  return '<div style="font-family:monospace;font-size:14px;color:#000;padding:8px">'
+    + warnHTML + cancelHTML + reprintHTML
     + stationHTML
     + '<div style="font-size:15px;font-weight:900;text-align:center;margin-bottom:2px">' + siteName + '</div>'
     + '<div style="font-size:11px;text-align:center;margin-bottom:6px">' + t('ticket') + ' - ' + now + '</div>'
@@ -23449,6 +23478,12 @@ function _renderAndPrintKitchenFrame(items, order, stationName, printerName, pap
     + '<hr style="border:1px dashed #000;margin:8px 0">'
     + '<div style="font-size:11px;text-align:center;color:#666">- ' + t('copy') + ' -</div>'
     + '</div>';
+}
+
+function _renderAndPrintKitchenFrame(items, order, stationName, printerName, paperWidthMm) {
+  var cleanStation = stationName ? stationName.replace(/[^\x00-\x7F\u00C0-\u024F\u0400-\u04FF\u10D0-\u10FF]/g, '').trim() : '';
+  var frame = document.getElementById('printReceiptFrame');
+  frame.innerHTML = _buildKitchenTicketHtml(items, order, stationName);
 
   // ── Kasa uygulamasındaysak ve bu istasyona yazıcı atanmışsa: O CİHAZA sessizce bas ──
   // (Kasa fişindeki _printReceiptSmart ile aynı mantık — dialog açmadan direkt basar)
@@ -24100,5 +24135,136 @@ async function persistKitchenStations(stations) {
 }
 </script>
 <script src="sync-indicator.js"></script>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════════════
+// MUTFAK FİŞ KUYRUĞU — YAZDIRMA SERVİSİ (yalnızca masaüstü Ana Bilgisayar)
+// Sunucu (server/printjobs.js) her "mutfağa bildir" farkı için kalıcı bir fiş kaydı
+// üretir. Bu servis kayıtları sırayla alır (claim), basar, sonucu geri yazar.
+// Basılamayan fiş kaybolmaz: tekrar denenir ve sol alttaki 🖨️ rozetinde görünür.
+// ══════════════════════════════════════════════════════════════════════════════
+function _pjActive() {
+  try { return typeof isDesktopApp === 'function' && isDesktopApp(); } catch (e) { return false; }
+}
+function _pjIsPrinter() {
+  return _pjActive() && (typeof isHostPrintDevice !== 'function' || isHostPrintDevice()) && !!localStorage.getItem('qr_token');
+}
+let _pjBusy = false, _pjTimer = null, _pjKickTimer = null;
+function _pjHeaders() { return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + localStorage.getItem('qr_token') }; }
+function _pjKick() { // gönderimden hemen sonra (sunucu 1.2 sn toplar) kuyruğa bak
+  if (_pjKickTimer) clearTimeout(_pjKickTimer);
+  _pjKickTimer = setTimeout(_pjTick, 1600);
+}
+async function _pjTick() {
+  if (_pjBusy || !_pjIsPrinter()) return;
+  _pjBusy = true;
+  try {
+    const r = await fetch('/api/index.php?table=print_jobs&status=pending', { headers: _pjHeaders() });
+    if (!r.ok) return;
+    const list = await r.json();
+    for (const j of (Array.isArray(list) ? list : [])) {
+      const cr = await fetch('/api/index.php?table=print_jobs&action=claim', { method: 'POST', headers: _pjHeaders(), body: JSON.stringify({ id: j.id }) });
+      const job = cr.ok ? await cr.json() : null;
+      if (!job || !job.id) continue;
+      await _pjPrintJob(job);
+    }
+  } catch (e) { console.warn('[fiş kuyruğu]', e); }
+  finally { _pjBusy = false; _pjRefreshBadge(); }
+}
+async function _pjPrintJob(job) {
+  const names = (job.items || []).map(i => i.quantity + ' ' + i.product_name).join(', ');
+  let res = { ok: false, error: 'bilinmiyor' };
+  try {
+    const order = { id: job.order_id, table_id: job.table_id, created_at: job.order_created_at || job.created_at, note: job.note, employee_name: job.employee_name };
+    const receiptPrinter = (typeof getReceiptPrinter === 'function' && getReceiptPrinter()) || '';
+    let printer = job.printer_name || receiptPrinter;
+    let warning = job.warning || '';
+    // 3 denemede basamayan istasyon yazıcısı → fiş kasa yazıcısına notla gider
+    if (job.printer_name && Number(job.attempts) >= 3 && receiptPrinter && receiptPrinter !== job.printer_name) {
+      printer = receiptPrinter; warning = 'YAZICI HATASI: ' + (job.station_name || job.printer_name);
+    }
+    if (!printer) res = { ok: false, error: 'Yazıcı seçili değil (Ayarlar > Yazıcı)' };
+    else {
+      const inner = _buildKitchenTicketHtml(job.items || [], order, job.station_name || '', { cancel: job.kind === 'cancel', reprint: !!job.reprint_of, warning: warning });
+      const html = '<div style="font-family:monospace;color:#000">' + inner + '</div>';
+      res = await _kasaSmartPrint(printer, html, Number(job.paper_mm) || Number(currentSettings.printer_width_mm) || 80);
+    }
+  } catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+  try {
+    await fetch('/api/index.php?table=print_jobs&id=' + encodeURIComponent(job.id), {
+      method: 'PUT', headers: _pjHeaders(),
+      body: JSON.stringify(res && res.ok ? { status: 'printed' } : { status: 'failed', error: (res && res.error) || 'basılamadı' })
+    });
+  } catch (e) {}
+  if (!(res && res.ok)) {
+    console.error('[fiş kuyruğu] basılamadı:', job.station_name, res && res.error, names);
+    if (Number(job.attempts) === 0) { try { showToast('❌ Fiş basılamadı (' + (job.station_name || 'kasa') + '): ' + names + ' — tekrar denenecek'); } catch (e) {} }
+  }
+}
+
+// ── Rozet + fiş geçmişi penceresi ──
+async function _pjRefreshBadge() {
+  // Rozet yalnızca fişleri basan (Ana Bilgisayar) cihazda görünür
+  if (!_pjIsPrinter()) { const ob = document.getElementById('pjBadge'); if (ob) ob.remove(); return; }
+  let b = document.getElementById('pjBadge');
+  if (!b) {
+    b = document.createElement('button');
+    b.id = 'pjBadge'; b.type = 'button'; b.onclick = _pjOpenModal;
+    b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:9998;border:none;border-radius:20px;padding:8px 14px;font-weight:800;font-size:13px;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.25)';
+    document.body.appendChild(b);
+  }
+  try {
+    const r = await fetch('/api/index.php?table=print_jobs&action=counts', { headers: _pjHeaders() });
+    const c = r.ok ? await r.json() : { waiting: 0, failed: 0 };
+    if (c.failed > 0) { b.style.background = '#d32f2f'; b.style.color = '#fff'; b.textContent = '⚠️ ' + c.failed + ' fiş basılamadı'; }
+    else if (c.waiting > 0) { b.style.background = '#f9a825'; b.style.color = '#000'; b.textContent = '🖨️ ' + c.waiting + ' fiş bekliyor'; }
+    else { b.style.background = 'rgba(0,0,0,.55)'; b.style.color = '#fff'; b.textContent = '🖨️'; }
+    b.title = 'Mutfak fiş geçmişi';
+  } catch (e) {}
+}
+function _pjEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+async function _pjOpenModal() {
+  let m = document.getElementById('pjModal');
+  if (!m) {
+    m = document.createElement('div'); m.id = 'pjModal';
+    m.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center';
+    m.onclick = e => { if (e.target === m) m.remove(); };
+    document.body.appendChild(m);
+  }
+  m.innerHTML = '<div style="background:var(--card-bg,#fff);color:var(--text,#000);width:min(720px,94vw);max-height:84vh;overflow:auto;border-radius:12px;padding:16px"><b>Yükleniyor…</b></div>';
+  let list = [];
+  try { const r = await fetch('/api/index.php?table=print_jobs&limit=60', { headers: _pjHeaders() }); list = r.ok ? await r.json() : []; } catch (e) {}
+  const stTxt = { pending: '⏳ Bekliyor', printing: '🖨️ Basılıyor', printed: '✅ Basıldı', failed: '❌ Basılamadı' };
+  const rows = (Array.isArray(list) ? list : []).map(j => {
+    const tb = (allTables || []).find(t => t.id === j.table_id);
+    const tl = tb ? (tb.is_takeaway ? (tb.label || 'Paket') : 'Masa ' + tb.number) : '—';
+    const items = (j.items || []).map(i => (j.kind === 'cancel' ? '−' : '') + i.quantity + ' ' + _pjEsc(i.product_name)).join(', ');
+    const tm = String(j.created_at || '').slice(11, 16);
+    const btns = '<button onclick="_pjAct(\'reprint\',\'' + j.id + '\')" style="margin:2px;padding:4px 8px;border-radius:6px;border:1px solid #888;cursor:pointer">Tekrar Bas</button>'
+      + (j.status === 'failed' || j.status === 'pending' ? '<button onclick="_pjAct(\'dismiss\',\'' + j.id + '\')" style="margin:2px;padding:4px 8px;border-radius:6px;border:1px solid #888;cursor:pointer">Basıldı say</button>' : '');
+    return '<tr style="border-bottom:1px solid #ddd' + (j.status === 'failed' ? ';background:rgba(211,47,47,.12)' : '') + '">'
+      + '<td style="padding:6px">' + tm + '</td><td style="padding:6px">' + _pjEsc(tl) + '</td>'
+      + '<td style="padding:6px">' + _pjEsc(j.station_name || 'Kasa') + (j.kind === 'cancel' ? ' <b>İPTAL</b>' : '') + (j.warning ? ' <b>(' + _pjEsc(j.warning) + ')</b>' : '') + '</td>'
+      + '<td style="padding:6px">' + items + '</td>'
+      + '<td style="padding:6px;white-space:nowrap">' + (stTxt[j.status] || j.status) + (j.last_error ? '<div style="font-size:11px;opacity:.7">' + _pjEsc(j.last_error) + '</div>' : '') + '</td>'
+      + '<td style="padding:6px;white-space:nowrap">' + btns + '</td></tr>';
+  }).join('');
+  m.innerHTML = '<div style="background:var(--card-bg,#fff);color:var(--text,#000);width:min(900px,96vw);max-height:84vh;overflow:auto;border-radius:12px;padding:16px">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><b style="font-size:17px">🖨️ Mutfak Fiş Geçmişi</b>'
+    + '<button onclick="document.getElementById(\'pjModal\').remove()" style="border:none;background:none;font-size:22px;cursor:pointer">✕</button></div>'
+    + (rows ? '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="text-align:left"><th style="padding:6px">Saat</th><th style="padding:6px">Masa</th><th style="padding:6px">İstasyon</th><th style="padding:6px">Ürünler</th><th style="padding:6px">Durum</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div>Henüz fiş yok.</div>')
+    + '</div>';
+}
+async function _pjAct(action, id) {
+  try { await fetch('/api/index.php?table=print_jobs&action=' + action, { method: 'POST', headers: _pjHeaders(), body: JSON.stringify({ id: id }) }); } catch (e) {}
+  _pjKick(); _pjRefreshBadge(); setTimeout(_pjOpenModal, 300);
+}
+(function () {
+  if (!_pjActive()) return;
+  _pjTimer = setInterval(_pjTick, 2500);
+  setInterval(_pjRefreshBadge, 5000);
+  setTimeout(_pjRefreshBadge, 3000);
+})();
+</script>
 </body>
 </html>
