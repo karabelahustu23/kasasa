@@ -8032,7 +8032,9 @@ if (error) { showToast(translations[currentLang].msg_logo_err + error.message); 
 showToast(translations[currentLang].msg_table_added);
 loadTablesAndOrders();
 }
+let _ltaoSeq = 0;
 async function loadTablesAndOrders() {
+const _mySeq = ++_ltaoSeq;
 if (isBusinessDayClosed) {
 const { data:tablesData } = await sb.from('tables').select('*').eq('restaurant_id', currentRestaurantId).order('number');
 allTables = tablesData || [];
@@ -8051,6 +8053,10 @@ if (currentSettings.last_closed_at) {
 query = query.gt('created_at', currentSettings.last_closed_at);
 }
 const { data:ordersData } = await query;
+// Aynı anda iki yükleme olursa (3 sn'lik tarama + "Mutfağa Gönder" sonrası yükleme)
+// GEÇ biten ESKİ istek yeni eklenen kalemleri içermeyen listeyi yazıyordu → o kalemler
+// sepetten düşüp istasyona hiç gönderilmiyordu. Eski isteğin sonucu artık atılır.
+if (_mySeq !== _ltaoSeq) return;
 const orders = ordersData || [];
 const currentPendingIds = new Set(orders.filter(o => o.status === 'pending').map(o => o.id));
 const _printedAsNewOrderIds = new Set(); // bu döngüde tam sipariş fişi zaten basılan siparişler — kalem bazlı fişte tekrar basılmasın
@@ -8611,8 +8617,10 @@ loadTablesAndOrders();
 }
 async function closeBusinessDay() {
 // Masa kontrolü: aktif sipariş olan masa varsa kapat
+// Gün kapatmayı yalnızca ÖDENMEMİŞ açık sipariş engeller. Eskiden ödenmiş (ön ödemeli)
+// ama "servis edildi" olmayan bir sipariş de engelliyordu ve gün hiç kapatılamıyordu.
 const activeTables = (window._lastOrders || []).filter(o =>
-  o.status !== 'served' || (o.is_paid !== true && o.is_paid != 1)
+  !o.voided_at && o.is_paid !== true && o.is_paid != 1
 );
 if (activeTables.length > 0) {
   showToast(translations[currentLang].msg_tables_not_empty || '⚠️ Tüm masalar boşaltılmadan gün kapatılamaz.');
@@ -8632,9 +8640,14 @@ try {
 // kayması veya sipariş/ödeme zaman farkı nedeniyle çakışmaya yol açar.
 let ordUrl = '/api/index.php?table=orders&restaurant_id=' + rid + '&is_paid=1';
 if (currentSettings.last_closed_at) ordUrl += '&gt_paid_at=' + encodeURIComponent(currentSettings.last_closed_at);
+// Üst sınır: rapor anından SONRA ödenenler bu rapora değil bir sonrakine girer
+// (yoksa kapanış sırasında alınan ödeme iki Z raporunda birden sayılırdı).
+ordUrl += '&lte_paid_at=' + encodeURIComponent(nowISO);
 const ordRes = await fetch(ordUrl, { headers });
 const ordData = await ordRes.json();
-const activeOrders = Array.isArray(ordData) ? ordData : [];
+// Sunucu is_paid filtresini desteklemese bile yalnızca ödenmişler sayılsın
+// (ödenmemiş siparişler "Toplam Sipariş" ve "Satılan Ürünler"e karışıyordu).
+const activeOrders = (Array.isArray(ordData) ? ordData : []).filter(o => o.is_paid === true || o.is_paid == 1);
 // 1b. İPTAL EDİLEN (voided) siparişleri hariç tut — bu siparişler için para
 // gerçekte kasada kalmadı (yerine açılan yeni sipariş kendi cirosunu ayrıca
 // oluşturacak). Voided siparişler is_paid=1 olarak DB'de kalmaya devam eder
@@ -8646,7 +8659,7 @@ const voidedOrders = activeOrders.filter(o => !!o.voided_at);
 // olarak eklenmişti. Z raporunda ciro bunlar düşülerek NET olarak gösterilmeli.
 let totalRefunds = 0; let refundEntries = [];
 try {
-  const refUrl = '/api/index.php?table=order_refunds' + (currentSettings.last_closed_at ? ('&gt_created_at=' + encodeURIComponent(currentSettings.last_closed_at)) : '');
+  const refUrl = '/api/index.php?table=order_refunds&restaurant_id=' + encodeURIComponent(rid) + (currentSettings.last_closed_at ? ('&gt_created_at=' + encodeURIComponent(currentSettings.last_closed_at)) : '') + '&lte_created_at=' + encodeURIComponent(nowISO);
   const refRes = await fetch(refUrl, { headers });
   const refData = await refRes.json();
   refundEntries = Array.isArray(refData) ? refData : [];
@@ -11008,8 +11021,13 @@ let error = null;
 try {
 const lr = await fetch('/api/index.php?table=orders&restaurant_id=' + encodeURIComponent(currentRestaurantId) + '&table_id=' + encodeURIComponent(tableId), { headers: { 'Authorization': 'Bearer ' + token } });
 const list = await lr.json();
-const openIds = (Array.isArray(list) ? list : []).filter(o => !Number(o.is_paid) && !o.voided_at && !['completed','cancelled'].includes(o.status)).map(o => o.id);
+const _open = (Array.isArray(list) ? list : []).filter(o => !o.voided_at && !['completed','cancelled'].includes(o.status));
+const openIds = _open.filter(o => !Number(o.is_paid)).map(o => o.id);
+const prepaidIds = _open.filter(o => Number(o.is_paid)).map(o => o.id);
 const paidAt = new Date().toISOString();
+for (const oid of prepaidIds) {
+await fetch('/api/index.php?table=orders&id=' + encodeURIComponent(oid), { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify({ status: 'completed' }) }).catch(() => {});
+}
 for (const oid of openIds) {
 const res = await fetch('/api/index.php?table=orders&id=' + encodeURIComponent(oid), {
 method: 'PUT',
@@ -18585,6 +18603,11 @@ if (saveBtn) saveBtn.disabled = false;
 // Tables sayfasındaki tableOrderPreparing() ile aynı mantık, POS sepetinden çalışır.
 async function posOrderPreparing(silent) {
 const t = translations[currentLang];
+// Sepeti gönderimden hemen önce sunucudan TAZE yükle. Eskiden bayat bir liste
+// kullanılabiliyordu: aynı anda eklenen bazı kalemler (ör. Pizza ×3, Xaçapuri'nin
+// ikinci satırı) listede olmadığından istasyona hiç gönderilmiyor, masada ise
+// görünmeye devam ediyordu.
+try { await loadTablesAndOrders(); posLoadCartFromOrders(); } catch (e) {}
 const orderId = posCurrentOrderId;
 if (!orderId) return;
 
@@ -18635,35 +18658,22 @@ note: posNote || '',
 created_at: new Date().toISOString(),
 order_items: pendingItems
 };
-if (!stations.length) {
-_enqueuePrint(pendingItems, orderForPrint, '');
-} else {
-const stationGroups = {};
-const noStationItems = [];
-pendingItems.forEach(function(item) {
-const prod = allProducts.find(function(p) { return p.id === item.product_id; });
-let matched = false;
-for (let si = 0; si < stations.length; si++) {
-const st = stations[si];
-if (_stationHasFilter(st) && _isProductInStation(prod, st)) {
-if (!stationGroups[st.id]) stationGroups[st.id] = { station: st, items: [] };
-stationGroups[st.id].items.push(item);
-matched = true;
-break;
-}
-}
-if (!matched) noStationItems.push(item);
-});
-Object.values(stationGroups).forEach(function(g) {
-_enqueuePrint(g.items, orderForPrint, (g.station.icon || '') + ' ' + g.station.name, g.station.printer_name || '', _stationPaperWidthMm(g.station));
-});
-if (noStationItems.length) _enqueuePrint(noStationItems, orderForPrint, '');
-}
+// Ortak yol: kalem kilidi + istasyon eşleme + istasyonsuz ürün uyarısı. Arka plan
+// taraması aynı kalemleri "yeni gönderildi" görüp ikinci kez basamaz (kilit).
+void stations;
+await autoPrintKitchenTicketsForOrder(orderForPrint);
 }
 
 if (!silent) showToast(t.pos_send_stations_success || '✅ İstasyonlara gönderildi');
 await loadTablesAndOrders();
 posLoadCartFromOrders();
+// Güvenlik ağı: gönderimden sonra hâlâ "gönderilmedi" kalan kalem varsa bir kez daha gönder.
+const _left = posCart.filter(function(i) { return !i._isNew && i.id && !(i.sent_to_kitchen == 1 || i.sent_to_kitchen === true); });
+if (_left.length && !posOrderPreparing._retrying) {
+  console.warn('[mutfak] gönderilmeden kalan kalemler tekrar gönderiliyor:', _left.map(function(i){ return i.product_name; }).join(', '));
+  posOrderPreparing._retrying = true;
+  try { await posOrderPreparing(true); } finally { posOrderPreparing._retrying = false; }
+}
 } catch(e) {
 showToast('❌ ' + (t.pos_send_stations_error || 'İstasyonlara gönderilemedi') + ': ' + e.message);
 } finally {
@@ -18814,7 +18824,11 @@ const newItemsTotal  = newItems.reduce((s, i) => s + i.price * i.quantity, 0);
 const thisOrderTotal = thisOrderBase + newItemsTotal;
 // Birden fazla ödenmemiş sipariş varsa: indirimi bu siparişin oranına göre böl
 const hasMultiOrder    = _unpaidOrders.length > 1;
-const totalForOrder    = hasMultiOrder ? thisOrderTotal : subtotal;
+// DİKKAT: total = kalemler + KDV olmalı (ciro her yerde total - indirim ile hesaplanıyor).
+// Eskiden KDV'siz ara toplam yazılıyordu → müşteri KDV'li tutarı ödediği halde Z raporu,
+// ciro ve nakit/kart kırılımı KDV kadar EKSİK çıkıyordu.
+const _vatShare        = (subtotal > 0 && vatAmount) ? vatAmount * ((hasMultiOrder ? thisOrderTotal : subtotal) / subtotal) : 0;
+const totalForOrder    = (hasMultiOrder ? thisOrderTotal : subtotal) + _vatShare;
 const discountForOrder = (hasMultiOrder && subtotal > 0)
   ? parseFloat((discountAmount * (thisOrderTotal / subtotal)).toFixed(2))
   : discountAmount;
@@ -22537,13 +22551,17 @@ function printKitchenTicket(orderId, itemId) {
 
   // Bu item hangi istasyona ait?
   const stations = window._kitchenStations || [];
-  const prod = allProducts.find(function(p) { return p.id === item.product_id; });
+  const prod = _resolveKitchenProduct(item);
   let stationName = '';
   let stationPrinter = '';
   let stationWidth = null;
   if (prod && stations.length) {
+    // Otomatik fişle AYNI kural (kategori + tek tek seçilen ürünler). Eskiden yalnız
+    // kategoriye bakılıyordu: ürün bazlı atanmış istasyonun fişi yanlış yazıcıya gidiyordu.
     const st = stations.find(function(s) {
-      return Array.isArray(s.categories) && s.categories.includes(prod.category_id);
+      return (typeof _stationHasFilter === 'function' && typeof _isProductInStation === 'function')
+        ? (_stationHasFilter(s) && _isProductInStation(prod, s))
+        : (Array.isArray(s.categories) && s.categories.includes(prod.category_id));
     });
     if (st) { stationName = (st.icon || '') + ' ' + st.name; stationPrinter = st.printer_name || ''; stationWidth = _stationPaperWidthMm(st); }
   }
@@ -22552,7 +22570,63 @@ function printKitchenTicket(orderId, itemId) {
 }
 
 // Otomatik fiş: sipariş gelince her istasyon için ayrı fiş bas
-function autoPrintKitchenTicketsForOrder(order) {
+// Otomatik fişler basılmadan önce kalemler "sahiplenilir": aynı kalem ikinci kez
+// (başka pencere, yenileme, senkron sonrası tekrar görünme) otomatik basılmaz.
+async function autoPrintKitchenTicketsForOrder(order) {
+  let items = Array.isArray(order.order_items) ? order.order_items : [];
+  const ids = items.map(i => i && i.id).filter(Boolean);
+  if (ids.length) {
+    try {
+      const r = await fetch('/api/index.php?table=kitchen_print_claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + localStorage.getItem('qr_token') },
+        body: JSON.stringify({ item_ids: ids })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const ok = new Set((d && d.claimed) || []);
+        items = items.filter(i => !i.id || ok.has(i.id));
+      }
+    } catch (e) { /* kilit sorulamadıysa basmaya devam — fiş kaybı çift fişten kötü */ }
+  }
+  if (!items.length) return;
+  // Ürün listesi eskiyse (sonradan eklenen / başka cihazdan açılan ürün) istasyon
+  // bulunamıyor ve fiş YANLIŞ yere gidiyordu → önce listeyi tazele.
+  if (items.some(i => !_resolveKitchenProduct(i)) && typeof loadProducts === 'function') {
+    try { await loadProducts(); } catch (e) {}
+  }
+  _autoPrintKitchenItems(Object.assign({}, order, { order_items: items }));
+}
+
+// Kalemin ürününü bul: önce id ile, bulunamazsa adıyla (varyant eki çıkarılarak).
+function _resolveKitchenProduct(item) {
+  if (!item) return null;
+  const list = allProducts || [];
+  let p = item.product_id ? list.find(x => x.id === item.product_id) : null;
+  if (p) return p;
+  const norm = s => String(s || '').toLocaleLowerCase('tr').replace(/\s+/g, ' ').trim();
+  const nm = norm(item.product_name);
+  if (!nm) return null;
+  p = list.find(x => norm(x.name) === nm);
+  if (!p && item.variant_name) {
+    const base = nm.replace(norm(item.variant_name), '').replace(/[()\-–,]+/g, ' ').trim();
+    p = list.find(x => norm(x.name) === base);
+  }
+  return p || null;
+}
+
+// Hiçbir istasyona uymayan ürünler: eskiden istasyonsuz/yazıcısız basılıyordu → fiş
+// ya hiç çıkmıyor ya da yanlış (varsayılan) yazıcıya gidiyordu, kimse fark etmiyordu.
+// Artık kasa yazıcısına "İSTASYON YOK" başlığıyla basılır ve ekranda uyarı çıkar.
+function _printNoStationItems(items, order) {
+  const names = items.map(i => i.product_name).join(', ');
+  console.warn('[mutfak fişi] istasyonu olmayan ürünler:', names);
+  try { showToast('⚠️ İstasyona atanmamış ürün: ' + names + ' — kasa yazıcısına basıldı. Ayarlar > İstasyonlar\'dan atayın.'); } catch (e) {}
+  const fallbackPrinter = (typeof getReceiptPrinter === 'function' && getReceiptPrinter()) || '';
+  _enqueuePrint(items, order, '⚠ ISTASYON YOK', fallbackPrinter);
+}
+
+function _autoPrintKitchenItems(order) {
   const stations = window._kitchenStations || [];
   const items = Array.isArray(order.order_items) ? order.order_items : [];
 
@@ -22566,7 +22640,7 @@ function autoPrintKitchenTicketsForOrder(order) {
   const noStationItems = [];
 
   items.forEach(function(item) {
-    const prod = allProducts.find(function(p) { return p.id === item.product_id; });
+    const prod = _resolveKitchenProduct(item);
     let matched = false;
     for (let si = 0; si < stations.length; si++) {
       const st = stations[si];
@@ -22584,9 +22658,7 @@ function autoPrintKitchenTicketsForOrder(order) {
     _enqueuePrint(g.items, order, (g.station.icon || '') + ' ' + g.station.name, g.station.printer_name || '', _stationPaperWidthMm(g.station));
   });
 
-  if (noStationItems.length) {
-    _enqueuePrint(noStationItems, order, '');
-  }
+  if (noStationItems.length) _printNoStationItems(noStationItems, order);
 }
 
 // Var olan bir siparişe (masaya) sonradan eklenen yeni ürünler için de otomatik
@@ -22687,7 +22759,7 @@ async function tableOrderPreparing(orderId) {
   const noStationItems = [];
 
   items.forEach(function(item) {
-    const prod = allProducts.find(function(p) { return p.id === item.product_id; });
+    const prod = _resolveKitchenProduct(item);
     let matched = false;
     for (let si = 0; si < stations.length; si++) {
       const st = stations[si];
@@ -22707,9 +22779,7 @@ async function tableOrderPreparing(orderId) {
   });
 
   // Kategorisiz ürünler için genel fiş
-  if (noStationItems.length) {
-    _enqueuePrint(noStationItems, order, '');
-  }
+  if (noStationItems.length) _printNoStationItems(noStationItems, order);
 }
 
 // Bir ürünün belirli bir istasyona ait olup olmadığını kontrol eder
@@ -23235,7 +23305,7 @@ function _printTicketForItem(orderId, itemId) {
   if (!item) return;
 
   const stations = window._kitchenStations || [];
-  const prod = allProducts.find(function(p) { return p.id === item.product_id; });
+  const prod = _resolveKitchenProduct(item);
   let stationName = '';
   let matchedStation = null;
 
@@ -23305,7 +23375,7 @@ function _processNextPrint() {
 // FIX (güvenlik ağı): kuyrukta iş var ama 20 sn'dir ilerlemiyorsa kilidi aç.
 setInterval(function() {
   if (!_kdPrinting) { window._kdLastTick = Date.now(); return; }
-  if (_kdPrintQueue.length && Date.now() - (window._kdLastTick || 0) > 20000) {
+  if (_kdPrintQueue.length && Date.now() - (window._kdLastTick || 0) > 60000) {
     console.warn('Fiş kuyruğu takıldı — kilit açılıyor');
     _kdPrinting = false;
     _processNextPrint();
@@ -23343,7 +23413,7 @@ function _renderAndPrintKitchenFrame(items, order, stationName, printerName, pap
 
   var rows = '';
   items.forEach(function(item) {
-    var itemProd = allProducts.find(function(p) { return p.id === item.product_id; });
+    var itemProd = _resolveKitchenProduct(item);
     var nameLines = getOrderItemTicketLines(item, itemProd);
     var nameHTML = nameLines[0];
     if (nameLines[1]) {
@@ -23384,17 +23454,37 @@ function _renderAndPrintKitchenFrame(items, order, stationName, printerName, pap
   // (Kasa fişindeki _printReceiptSmart ile aynı mantık — dialog açmadan direkt basar)
   if (isDesktopApp() && printerName) {
     const html = '<div style="font-family:monospace;color:#000">' + frame.innerHTML + '</div>';
-    _kasaSmartPrint(printerName, html, Number(paperWidthMm) || Number(currentSettings.printer_width_mm) || 80).then(function(res) {
+    const _w = Number(paperWidthMm) || Number(currentSettings.printer_width_mm) || 80;
+    const _names = items.map(function(i) { return i.product_name; }).join(', ');
+    // Yazıcı anlık meşgul/uykudaysa ilk deneme düşebiliyor → bir kez daha dene;
+    // yine olmazsa kullanıcıya HANGİ ürünlerin basılamadığını göster.
+    const _try = function() { return _kasaSmartPrint(printerName, html, _w).catch(function(e) { return { ok: false, error: e && e.message }; }); };
+    const _wait = function(ms) { return new Promise(function(r) { setTimeout(r, ms); }); };
+    _try().then(function(res) {
+      if (res && res.ok) return res;
+      window._kdLastTick = Date.now();
+      return _wait(1500).then(_try);
+    }).then(function(res) {
+      if (res && res.ok) return res;
+      window._kdLastTick = Date.now();
+      return _wait(4000).then(_try);
+    }).then(function(res) {
       frame.style.display = 'none';
       if (!res || !res.ok) {
-        // Basılamadıysa eski yönteme (dialog) düş
+        console.error('[mutfak fişi] basılamadı:', printerName, res && res.error, _names);
+        // Diyalog penceresi masaüstünde görünmüyor/kaybediliyordu. Kasa yazıcısı
+        // farklıysa fişi oraya "YAZICI HATASI" notuyla bas ve ekranda uyar.
+        const rp = (typeof getReceiptPrinter === 'function' && getReceiptPrinter()) || '';
+        try { showToast('❌ ' + (cleanStation || printerName) + ' yazıcısı basmadı: ' + _names + (rp && rp !== printerName ? ' — kasa yazıcısına basıldı' : '')); } catch (e) {}
+        if (rp && rp !== printerName) {
+          const html2 = '<div style="font-family:monospace;color:#000;text-align:center;font-weight:900;border:2px solid #000;padding:2px;margin-bottom:4px">YAZICI HATASI: ' + (cleanStation || printerName) + '</div>' + html;
+          _kasaSmartPrint(rp, html2, _w).catch(function(){}).then(function() { setTimeout(_processNextPrint, 300); });
+          return;
+        }
         _printKitchenFrameFallback(frame);
         return;
       }
       setTimeout(_processNextPrint, 300);
-    }).catch(function() {
-      frame.style.display = 'none';
-      _printKitchenFrameFallback(frame);
     });
     return;
   }
