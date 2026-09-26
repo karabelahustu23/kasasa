@@ -1,465 +1,476 @@
-// server/schema.js — Local SQLite şeması (schema.sql'in SQLite karşılığı)
-// MySQL'deki UUID()/JSON/ENUM/ON UPDATE gibi özellikler SQLite'ta yok;
-// bunlar uygulama katmanında (helpers.js) karşılanıyor.
+// server/helpers.js — index.php/config.php içindeki yardımcı fonksiyonların
+// Node/SQLite (better-sqlite3, senkron) karşılığı.
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const { getDB } = require('./db');
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS restaurants (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  auth_user_id TEXT,
-  logo_url TEXT,
-  phone TEXT,
-  address TEXT,
-  city TEXT,
-  country TEXT DEFAULT 'TR',
-  description TEXT,
-  plan TEXT DEFAULT 'basic',
-  is_active INTEGER DEFAULT 1,
-  menu_number INTEGER,
-  slug TEXT,
-  primary_color TEXT DEFAULT '#d4af37',
-  theme TEXT DEFAULT 'dark',
-  total_orders INTEGER DEFAULT 0,
-  total_revenue REAL DEFAULT 0,
-  custom_menu_url TEXT,
-  trial_ends_at TEXT,
-  created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now'))
-);
+function uuid() {
+  return crypto.randomUUID();
+}
 
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  password TEXT NOT NULL,
-  role TEXT DEFAULT 'owner',
-  restaurant_id TEXT,
-  role_key TEXT,
-  permissions TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// ── SAAT DİLİMİ ──────────────────────────────────────────────
+// KÖK SORUN: online sunucu (index.php) zaman damgalarını restoranın saat
+// dilimiyle yazıyor (date_default_timezone_set — varsayılan Europe/Istanbul),
+// uygulama ise UTC yazıyordu. Aynı local veritabanında iki farklı saat dilimi
+// karışıyordu: siteden çekilen siparişler +03, uygulamada verilenler UTC.
+// Ciro dönemi "gt_paid_at=last_closed_at" ile süzüldüğü için, gün kapanışından
+// sonraki saatlerin siparişleri yanlış döneme düşüyor ve gün sonu raporu yanlış
+// tarihe yazılıyordu. Artık uygulama da sunucuyla AYNI saat dilimini kullanıyor.
+let _tzCache = { tz: null, at: 0 };
+function restaurantTz() {
+  if (_tzCache.tz && Date.now() - _tzCache.at < 60000) return _tzCache.tz;
+  let tz = 'Europe/Istanbul';
+  try {
+    const row = getDB().prepare('SELECT timezone FROM settings LIMIT 1').get();
+    if (row && row.timezone) tz = row.timezone;
+  } catch (e) { /* settings henüz yok — varsayılan */ }
+  // Geçersiz bir değer tüm tarihleri bozmasın
+  try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); }
+  catch (e) { tz = 'Europe/Istanbul'; }
+  _tzCache = { tz, at: Date.now() };
+  return tz;
+}
 
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  token TEXT UNIQUE NOT NULL,
-  expires_at TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// Bir tarihi "YYYY-MM-DD HH:MM:SS" olarak restoranın saat diliminde biçimler.
+function fmtInTz(d, tz) {
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+  const hh = p.hour === '24' ? '00' : p.hour;
+  return `${p.year}-${p.month}-${p.day} ${hh}:${p.minute}:${p.second}`;
+}
 
-CREATE TABLE IF NOT EXISTS categories (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  name TEXT,
-  icon TEXT,
-  image_url TEXT,
-  sort_order INTEGER DEFAULT 0,
-  translations TEXT,
-  is_active INTEGER DEFAULT 1,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function nowSql() {
+  return fmtInTz(new Date(), restaurantTz());
+}
 
-CREATE TABLE IF NOT EXISTS products (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  category_id TEXT,
-  name TEXT NOT NULL,
-  description TEXT,
-  price REAL NOT NULL,
-  image_url TEXT,
-  is_available INTEGER DEFAULT 1,
-  is_featured INTEGER DEFAULT 0,
-  translations TEXT,
-  stock INTEGER,
-  hidden_from_menu INTEGER DEFAULT 0,
-  vat_exempt INTEGER DEFAULT 0,
-  sort_order INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function toMysqlDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return v;
+  return fmtInTz(d, restaurantTz());
+}
 
-CREATE TABLE IF NOT EXISTS product_variants (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  price REAL NOT NULL,
-  sort_order INTEGER DEFAULT 0,
-  translations TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// ── HTTP hata sınıfı: routes.js bunu yakalayıp {error,...} JSON'a çevirir ──
+class ApiError extends Error {
+  constructor(message, code = 400, extra = null) {
+    super(message);
+    this.code = code;
+    this.extra = extra;
+  }
+}
+function errorResponse(message, code = 400, extra = null) {
+  throw new ApiError(message, code, extra);
+}
 
-CREATE TABLE IF NOT EXISTS tables (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  number INTEGER NOT NULL,
-  status TEXT DEFAULT 'empty',
-  color TEXT DEFAULT '#1a1a2e',
-  label TEXT,
-  is_takeaway INTEGER DEFAULT 0,
-  opened_at TEXT,
-  zone TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// ── AUTH ─────────────────────────────────────────────────────
+function getAuthUser(req) {
+  const h = req.headers['authorization'] || '';
+  if (!h.startsWith('Bearer ')) return null;
+  const token = h.slice(7);
+  const db = getDB();
+  const row = db.prepare(
+    `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token = ? AND s.expires_at > datetime('now') LIMIT 1`
+  ).get(token);
+  return row || null;
+}
 
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  table_id TEXT,
-  status TEXT DEFAULT 'pending',
-  total REAL DEFAULT 0,
-  note TEXT,
-  is_paid INTEGER DEFAULT 0,
-  ready_at TEXT,
-  served_at TEXT,
-  payment_method TEXT,
-  discount_amount REAL DEFAULT 0,
-  paid_at TEXT,
-  bank_name TEXT,
-  delivery_company TEXT,
-  vat_amount REAL DEFAULT 0,
-  employee_name TEXT,
-  receipt_printed_at TEXT,
-  voided_at TEXT,
-  void_reason TEXT,
-  replacement_order_id TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function requireAuth(req) {
+  const u = getAuthUser(req);
+  if (!u) errorResponse('Kimlik doğrulama gerekli', 401);
+  return u;
+}
 
-CREATE TABLE IF NOT EXISTS order_items (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  order_id TEXT,
-  product_id TEXT,
-  product_name TEXT NOT NULL,
-  variant_name TEXT,
-  quantity INTEGER NOT NULL,
-  price REAL NOT NULL,
-  ingredient_cost REAL,
-  is_ready INTEGER DEFAULT 0,
-  sent_to_kitchen INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function requireAuthActive(req) {
+  const user = requireAuth(req);
+  if (user.role === 'superadmin') return user;
+  const rid = user.restaurant_id;
+  if (rid) {
+    const db = getDB();
+    const row = db.prepare('SELECT is_active FROM restaurants WHERE id=?').get(rid);
+    if (!row || Number(row.is_active) !== 1) {
+      errorResponse('Bu restoran pasif durumda. Lütfen yönetici ile iletişime geçin.', 403);
+    }
+  }
+  return user;
+}
 
-CREATE TABLE IF NOT EXISTS order_refunds (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  order_id TEXT NOT NULL,
-  amount REAL NOT NULL,
-  reason TEXT,
-  employee_name TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function requireSuperadmin(req) {
+  const u = requireAuth(req);
+  if (u.role !== 'superadmin') errorResponse('Yetki yetersiz', 403);
+  return u;
+}
 
-CREATE TABLE IF NOT EXISTS settings (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT UNIQUE,
-  site_name TEXT DEFAULT 'Restoran',
-  currency TEXT DEFAULT '₺',
-  logo_url TEXT,
-  vat_enabled INTEGER DEFAULT 0,
-  vat_rate REAL DEFAULT 0,
-  is_open INTEGER DEFAULT 1,
-  is_day_closed INTEGER DEFAULT 0,
-  last_closed_at TEXT,
-  timezone TEXT DEFAULT 'Europe/Istanbul',
-  stock_enabled INTEGER DEFAULT 0,
-  recipe_stock_enabled INTEGER DEFAULT 0,
-  pos_category_first_enabled INTEGER DEFAULT 0,
-  pos_category_no_photo_enabled INTEGER DEFAULT 0,
-  menu_category_first_enabled INTEGER DEFAULT 0,
-  delete_pin TEXT,
-  pin_enabled INTEGER DEFAULT 0,
-  bog_payment_enabled INTEGER DEFAULT 0,
-  bog_client_id TEXT,
-  bog_client_secret TEXT,
-  custom_roles TEXT,
-  bank_names TEXT,
-  delivery_companies TEXT,
-  kitchen_stations TEXT,
-  table_zones TEXT,
-  kitchen_auto_print INTEGER DEFAULT 0,
-  phone_order_auto_print INTEGER DEFAULT 0,
-  pos_send_auto_print INTEGER DEFAULT 0,
-  host_device_no_pin_delete INTEGER DEFAULT 0,
-  day_close_report_print INTEGER DEFAULT 0,
-  expenses_enabled INTEGER DEFAULT 0,
-  printer_width_mm INTEGER DEFAULT 80,
-  revenue_pin TEXT,
-  phone_order_print_device_id TEXT,
-  phone_order_print_device_name TEXT,
-  host_device_enabled INTEGER DEFAULT 0,
-  host_device_last_seen TEXT,
-  kitchen_ticket_lang1 TEXT,
-  kitchen_ticket_lang2 TEXT,
-  receipt_ticket_lang1 TEXT,
-  receipt_ticket_lang2 TEXT,
-  default_break_minutes INTEGER DEFAULT 15,
-  break_overtime_alert INTEGER DEFAULT 1,
-  enabled_languages TEXT,
-  az_translate_products INTEGER DEFAULT 0,
-  schedule_enabled INTEGER DEFAULT 1,
-  instagram_url TEXT,
-  gmail TEXT,
-  location_url TEXT,
-  google_reviews_url TEXT,
-  contact_phone TEXT,
-  working_hours TEXT,
-  working_days TEXT,
-  location_lat REAL,
-  location_lng REAL,
-  admin_enabled_languages TEXT,
-  default_admin_lang TEXT DEFAULT 'tr',
-  openai_api_key TEXT,
-  groq_api_key TEXT,
-  gemini_api_key TEXT,
-  ai_order_provider TEXT DEFAULT 'openai',
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function getMyRestaurantId(user) {
+  return user.role === 'superadmin' ? null : (user.restaurant_id || null);
+}
 
-CREATE TABLE IF NOT EXISTS expenses (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  amount REAL NOT NULL DEFAULT 0,
-  description TEXT,
-  employee_name TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function assertOwnsRow(table, id, user) {
+  const db = getDB();
+  if (user.role === 'superadmin') {
+    const row = db.prepare(`SELECT * FROM "${table}" WHERE id=?`).get(id);
+    if (!row) errorResponse('Kayıt bulunamadı', 404);
+    return row;
+  }
+  const myRid = user.restaurant_id;
+  if (!myRid) errorResponse('Yetki yetersiz', 403);
+  const row = db.prepare(`SELECT * FROM "${table}" WHERE id=?`).get(id);
+  if (!row) errorResponse('Kayıt bulunamadı', 404);
+  if ((row.restaurant_id || null) !== myRid) errorResponse('Yetki yetersiz', 403);
+  return row;
+}
 
-CREATE TABLE IF NOT EXISTS daily_reports (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  report_date TEXT NOT NULL,
-  total_revenue REAL DEFAULT 0,
-  total_orders INTEGER DEFAULT 0,
-  all_orders_count INTEGER DEFAULT 0,
-  total_discount REAL DEFAULT 0,
-  total_refunds REAL DEFAULT 0,
-  net_revenue REAL DEFAULT 0,
-  voided_orders_count INTEGER DEFAULT 0,
-  total_expenses REAL DEFAULT 0,
-  top_products TEXT,
-  payment_breakdown TEXT,
-  note TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function assertOwnsRestaurant(rid, user) {
+  if (user.role === 'superadmin') {
+    if (!rid) errorResponse('restaurant_id gerekli');
+    return rid;
+  }
+  const myRid = user.restaurant_id;
+  if (!myRid) errorResponse('Yetki yetersiz', 403);
+  if (rid && rid !== myRid) errorResponse('Yetki yetersiz', 403);
+  return myRid;
+}
 
-CREATE TABLE IF NOT EXISTS feedback (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id TEXT,
-  table_number INTEGER,
-  rating INTEGER,
-  comment TEXT,
-  is_read INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function resolveEntityId(body) {
+  const clientId = body && body.id;
+  if (clientId && typeof clientId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)) {
+    return clientId;
+  }
+  return uuid();
+}
 
-CREATE TABLE IF NOT EXISTS coupons (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  code TEXT NOT NULL,
-  discount_type TEXT NOT NULL DEFAULT 'percent',
-  discount_value REAL NOT NULL,
-  min_order_amount REAL DEFAULT 0,
-  start_date TEXT,
-  end_date TEXT,
-  max_usage INTEGER,
-  usage_count INTEGER DEFAULT 0,
-  is_active INTEGER DEFAULT 1,
-  auto_apply INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function resolveUserPermissions(user) {
+  if (user.permissions) {
+    try {
+      const decoded = JSON.parse(user.permissions);
+      if (Array.isArray(decoded) && decoded.length > 0) return decoded;
+    } catch (e) {}
+  }
+  if (user.role_key && user.restaurant_id) {
+    const db = getDB();
+    const row = db.prepare('SELECT custom_roles FROM settings WHERE restaurant_id=?').get(user.restaurant_id);
+    if (row && row.custom_roles) {
+      try {
+        const roles = JSON.parse(row.custom_roles);
+        if (Array.isArray(roles)) {
+          const found = roles.find(r => r.id === user.role_key);
+          if (found) return Array.isArray(found.permissions) ? found.permissions : [];
+        }
+      } catch (e) {}
+    }
+  }
+  return [];
+}
 
-CREATE TABLE IF NOT EXISTS happy_hours (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  name TEXT NOT NULL,
-  discount_type TEXT NOT NULL DEFAULT 'percent',
-  discount_value REAL NOT NULL,
-  min_order_amount REAL DEFAULT 0,
-  start_time TEXT NOT NULL,
-  end_time TEXT NOT NULL,
-  days_of_week TEXT DEFAULT '0,1,2,3,4',
-  scope TEXT DEFAULT 'all',
-  category_id TEXT,
-  is_active INTEGER DEFAULT 1,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// publishEvent: local modda gerçek zamanlı SSE olmadığından basit no-op —
+// istenirse ileride local websocket/BroadcastChannel'a bağlanabilir.
+function publishEvent() {}
 
-CREATE TABLE IF NOT EXISTS carousel_slides (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT,
-  image_url TEXT,
-  title TEXT,
-  subtitle TEXT,
-  height INTEGER DEFAULT 180,
-  autoplay_interval INTEGER DEFAULT 4,
-  sort_order INTEGER DEFAULT 0,
-  is_active INTEGER DEFAULT 1,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// ── VAT / STOK yardımcıları (index.php birebir mantık) ─────────
+function getRestaurantVat(rid) {
+  const db = getDB();
+  const row = db.prepare('SELECT vat_enabled, vat_rate FROM settings WHERE restaurant_id=?').get(rid);
+  const enabled = row ? !!(Number(row.vat_enabled) === 1) : false;
+  const rate = row ? Number(row.vat_rate || 0) : 0;
+  return { enabled, rate };
+}
 
-CREATE TABLE IF NOT EXISTS ingredients (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  unit TEXT NOT NULL DEFAULT 'gr',
-  stock REAL DEFAULT 0,
-  min_stock REAL DEFAULT 0,
-  cost_per_unit REAL DEFAULT 0,
-  category TEXT,
-  supplier TEXT,
-  updated_at TEXT DEFAULT (datetime('now')),
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// Delivery (paket/teslimat) masası mı? (tables.is_takeaway=1) — bu siparişlerden KDV alınmaz.
+function isDeliveryTable(tableId) {
+  if (!tableId) return false;
+  const db = getDB();
+  const row = db.prepare('SELECT is_takeaway FROM tables WHERE id=?').get(tableId);
+  return !!(row && Number(row.is_takeaway) === 1);
+}
 
-CREATE TABLE IF NOT EXISTS recipes (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
-  ingredient_id TEXT NOT NULL,
-  amount REAL NOT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(product_id, ingredient_id)
-);
+// Sipariş/masa için geçerli KDV bilgisi: delivery ise KDV kapalı döner.
+function getOrderVat(rid, tableId, deliveryCompany) {
+  const vat = getRestaurantVat(rid);
+  if (isDeliveryTable(tableId) || (deliveryCompany && String(deliveryCompany).trim() !== '')) return { enabled: false, rate: vat.rate };
+  return vat;
+}
 
-CREATE TABLE IF NOT EXISTS stock_logs (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  ingredient_id TEXT NOT NULL,
-  order_id TEXT,
-  change_type TEXT NOT NULL DEFAULT 'deduct',
-  qty_before REAL NOT NULL,
-  qty_change REAL NOT NULL,
-  qty_after REAL NOT NULL,
-  note TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+// Arayüzle (admin.html posCalculateTotals / renderTables) BİREBİR aynı kural:
+//  • total = kalemler toplamı + KDV   (indirim total'dan DÜŞÜLMEZ; arayüz her yerde
+//    "total - discount_amount" ile net tutarı hesaplıyor — düşülürse indirim 2 kez düşer)
+//  • KDV, vat_exempt OLMAYAN ürünler üzerinden, indirim oranlı dağıtılarak hesaplanır
+//  • Delivery masalarında KDV yok
+function computeTotals(rid, tableId, items, discountAmount = 0, deliveryCompany = null) {
+  const db = getDB();
+  const exemptStmt = db.prepare('SELECT vat_exempt FROM products WHERE id=?');
+  let subtotal = 0, vatable = 0;
+  for (const it of (items || [])) {
+    const line = Number(it.price || 0) * Number(it.quantity || 0);
+    subtotal += line;
+    const p = it.product_id ? exemptStmt.get(it.product_id) : null;
+    if (!(p && Number(p.vat_exempt) === 1)) vatable += line;
+  }
+  const discount = Math.min(Number(discountAmount || 0), subtotal);
+  const vatableAfterDiscount = subtotal > 0 ? vatable - discount * (vatable / subtotal) : 0;
+  const vat = getOrderVat(rid, tableId, deliveryCompany);
+  const vatAmount = (vat.enabled && vatableAfterDiscount > 0)
+    ? Math.round(vatableAfterDiscount * (vat.rate / 100) * 100) / 100 : 0;
+  const total = Math.round((subtotal + vatAmount) * 100) / 100;
+  return { subtotal, vat_amount: vatAmount, total };
+}
 
-CREATE TABLE IF NOT EXISTS product_stock_logs (
-  id TEXT PRIMARY KEY,
-  restaurant_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
-  order_id TEXT,
-  change_type TEXT NOT NULL DEFAULT 'manual',
-  qty_before INTEGER NOT NULL DEFAULT 0,
-  qty_change INTEGER NOT NULL DEFAULT 0,
-  qty_after INTEGER NOT NULL DEFAULT 0,
-  note TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+function computeOrderTotalFromItems(rid, orderId, discountAmount = 0) {
+  const db = getDB();
+  const items = db.prepare('SELECT product_id, price, quantity FROM order_items WHERE order_id=?').all(orderId);
+  const ord = db.prepare('SELECT table_id, delivery_company FROM orders WHERE id=?').get(orderId);
+  return computeTotals(rid, ord && ord.table_id, items, discountAmount, ord && ord.delivery_company);
+}
 
--- ── OFFLINE SENKRON ────────────────────────────────────────────
--- Bu cihazda offline iken yapılan TÜM yazma istekleri, internet gelince
--- online sunucuya (aynı X-Idempotency-Key koruması ile) tekrar gönderilmek
--- üzere burada kuyruklanır.
-CREATE TABLE IF NOT EXISTS sync_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  idempotency_key TEXT UNIQUE NOT NULL,
-  method TEXT NOT NULL,
-  path TEXT NOT NULL,
-  body TEXT,
-  is_form INTEGER DEFAULT 0,
-  status TEXT DEFAULT 'pending',
-  attempts INTEGER DEFAULT 0,
-  last_error TEXT,
-  created_at TEXT DEFAULT (datetime('now')),
-  synced_at TEXT
-);
+function checkRestaurantOpen(rid) {
+  const db = getDB();
+  const row = db.prepare('SELECT is_open FROM settings WHERE restaurant_id=?').get(rid);
+  if (row && !(Number(row.is_open) === 1)) {
+    errorResponse('Restoran şu anda kapalı, sipariş alınamıyor', 403, { error: 'restaurant_closed' });
+  }
+}
 
--- ID EŞLEME KATMANI
--- Local kayıtların id'si ile online sunucudaki karşılıklarının id'si her zaman
--- aynı olmayabilir (sunucu gönderdiğimiz id'yi yok sayıp kendi id'sini üretebilir).
--- Bu tablo ikisini birbirine bağlar: local id ASLA değişmez, dışarı giden her
--- istek gönderilirken uzak id'ye çevrilir, gelen her satır local id'ye çevrilir.
--- 404 / kopya kayıt / kaybolan durum bilgisi sorunlarının tamamı buradan çözülür.
-CREATE TABLE IF NOT EXISTS id_map (
-  entity_table TEXT NOT NULL,
-  local_id TEXT NOT NULL,
-  remote_id TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
-  PRIMARY KEY (entity_table, local_id)
-);
-CREATE INDEX IF NOT EXISTS idx_idmap_remote ON id_map(entity_table, remote_id);
+function checkRecipeStockSufficiency(rid, items) {
+  const db = getDB();
+  const s = db.prepare('SELECT recipe_stock_enabled FROM settings WHERE restaurant_id=?').get(rid);
+  if (!s || Number(s.recipe_stock_enabled) !== 1) return;
 
--- Bu cihazın kimlik/bağlantı bilgileri (ilk kurulumda doldurulur)
-CREATE TABLE IF NOT EXISTS app_config (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
+  const productIds = [...new Set(items.map(i => i.product_id).filter(Boolean))];
+  if (!productIds.length) return;
 
--- Local gerçek zamanlı olay defteri (SSE / uzun-bekleyen yedek için)
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id TEXT NOT NULL,
-  event TEXT NOT NULL,
-  payload TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_events_rid ON events(restaurant_id, id);
+  const ph = productIds.map(() => '?').join(',');
+  const recipeRows = db.prepare(`SELECT product_id, ingredient_id, amount FROM recipes WHERE product_id IN (${ph})`).all(...productIds);
+  const recipeMap = {};
+  for (const r of recipeRows) {
+    (recipeMap[r.product_id] = recipeMap[r.product_id] || []).push({ ingredient_id: r.ingredient_id, amount: Number(r.amount) });
+  }
 
--- Offline'da kaydedilen dosyaların online sunucudaki karşılığı
--- (yükleme senkronize edilince local /uploads/... yolu remote URL ile eşlenir)
-CREATE TABLE IF NOT EXISTS url_map (
-  local_url TEXT PRIMARY KEY,
-  remote_url TEXT,
-  bucket TEXT,
-  file_path TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
+  const totalNeeded = {};
+  for (const item of items) {
+    const pid = item.product_id;
+    const qty = Number(item.quantity || 1);
+    if (!pid || !recipeMap[pid]) continue;
+    for (const rcp of recipeMap[pid]) {
+      totalNeeded[rcp.ingredient_id] = (totalNeeded[rcp.ingredient_id] || 0) + rcp.amount * qty;
+    }
+  }
+  if (!Object.keys(totalNeeded).length) return;
 
-CREATE INDEX IF NOT EXISTS idx_syncq_status ON sync_queue(status, id);
+  const iids = Object.keys(totalNeeded);
+  const iPh = iids.map(() => '?').join(',');
+  const stockRows = db.prepare(`SELECT id, stock FROM ingredients WHERE id IN (${iPh})`).all(...iids);
+  const stockMap = {};
+  for (const ing of stockRows) stockMap[ing.id] = Number(ing.stock);
 
--- Personel/vardiya/mola/rezervasyon gibi henüz tam olarak local'e taşınmamış
--- modüller için genel amaçlı depo. Bu sayede routes.js bu tablolar için 501
--- döndürmek yerine en azından okuma/yazma yapabiliyor; yazmalar zaten
--- sync_queue üzerinden online sunucunun GERÇEK (tam işlenmiş) uç noktasına
--- gönderiliyor — buradaki depo sadece offline'dayken görünürlük sağlar.
-CREATE TABLE IF NOT EXISTS aux_records (
-  id TEXT PRIMARY KEY,
-  table_name TEXT NOT NULL,
-  restaurant_id TEXT,
-  data TEXT,
-  updated_at TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_aux_lookup ON aux_records(table_name, restaurant_id);
-`;
-
-// Var olan kurulumlarda (eski sürümden güncelleyenlerde) eksik sütunları ekler.
-// SQLite'ta "ADD COLUMN IF NOT EXISTS" yok; PRAGMA ile kontrol ediyoruz.
-const MIGRATIONS = {
-  sync_queue: {
-    next_attempt_at: `ALTER TABLE sync_queue ADD COLUMN next_attempt_at TEXT`,
-    entity_table: `ALTER TABLE sync_queue ADD COLUMN entity_table TEXT`,
-    entity_id: `ALTER TABLE sync_queue ADD COLUMN entity_id TEXT`,
-    file_path: `ALTER TABLE sync_queue ADD COLUMN file_path TEXT`,
-    local_url: `ALTER TABLE sync_queue ADD COLUMN local_url TEXT`,
-  },
-  // Kasa/Garson ekraninda urunlerin elle surukleyerek siralanabilmesi icin.
-  // Eski kurulumlarda products.sort_order yoktu; burada eklenir.
-  products: {
-    sort_order: `ALTER TABLE products ADD COLUMN sort_order INTEGER DEFAULT 0`,
-  },
-  categories: {
-    sort_order: `ALTER TABLE categories ADD COLUMN sort_order INTEGER DEFAULT 0`,
-  },
-};
-
-function migrate(db) {
-  for (const [table, cols] of Object.entries(MIGRATIONS)) {
-    let existing;
-    try { existing = new Set(db.prepare(`PRAGMA table_info("${table}")`).all().map(c => c.name)); }
-    catch (e) { continue; }
-    if (!existing.size) continue;
-    for (const [col, sql] of Object.entries(cols)) {
-      if (existing.has(col)) continue;
-      try { db.exec(sql); } catch (e) { console.warn(`migrate ${table}.${col}:`, e.message); }
+  for (const [iid, needed] of Object.entries(totalNeeded)) {
+    const avail = stockMap[iid] || 0;
+    if (needed > avail + 0.0001) {
+      errorResponse('insufficient_stock', 409, {
+        error: 'insufficient_stock',
+        ingredient_id: iid,
+        needed: Math.round(needed * 1000) / 1000,
+        available: Math.round(avail * 1000) / 1000,
+      });
     }
   }
 }
 
-function initSchema(db) {
-  db.exec(SCHEMA);
-  migrate(db);
+function checkProductStockSufficiency(rid, items) {
+  const db = getDB();
+  const s = db.prepare('SELECT stock_enabled FROM settings WHERE restaurant_id=?').get(rid);
+  if (!s || Number(s.stock_enabled) !== 1) return;
+
+  const productIds = [...new Set(items.map(i => i.product_id).filter(Boolean))];
+  if (!productIds.length) return;
+  const ph = productIds.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT id, name, stock FROM products WHERE id IN (${ph})`).all(...productIds);
+  const stockMap = {};
+  for (const p of rows) stockMap[p.id] = p;
+
+  const neededByProduct = {};
+  for (const item of items) {
+    const pid = item.product_id;
+    if (!pid) continue;
+    neededByProduct[pid] = (neededByProduct[pid] || 0) + Number(item.quantity || 1);
+  }
+  for (const [pid, needed] of Object.entries(neededByProduct)) {
+    const p = stockMap[pid];
+    if (!p || p.stock === null || p.stock === undefined) continue; // stok takibi olmayan ürün
+    if (needed > Number(p.stock) + 0.0001) {
+      errorResponse(`"${p.name}" için yeterli stok yok (mevcut: ${p.stock})`, 409, { error: 'insufficient_product_stock', product_id: pid });
+    }
+  }
 }
 
-module.exports = { initSchema };
+function refreshProductAvailability(affectedProductIds, ingMap = {}) {
+  const db = getDB();
+  for (const apid of affectedProductIds) {
+    const rows = db.prepare(
+      `SELECT r.amount, i.stock, r.ingredient_id FROM recipes r JOIN ingredients i ON i.id=r.ingredient_id WHERE r.product_id=?`
+    ).all(apid);
+    if (!rows.length) continue;
+    let canMake = true;
+    for (const rcp of rows) {
+      const stock = ingMap[rcp.ingredient_id] ? ingMap[rcp.ingredient_id].stock : Number(rcp.stock);
+      if (Number(rcp.amount) > stock + 0.0001) { canMake = false; break; }
+    }
+    db.prepare('UPDATE products SET is_available=? WHERE id=?').run(canMake ? 1 : 0, apid);
+  }
+}
+
+// Malzeme stoklarını düşer (recipe_stock_enabled açıkken), item başına maliyeti döner.
+function deductRecipeStock(rid, items, orderId = null) {
+  const db = getDB();
+  const costs = {};
+  const s = db.prepare('SELECT recipe_stock_enabled FROM settings WHERE restaurant_id=?').get(rid);
+  if (!s || Number(s.recipe_stock_enabled) !== 1) return costs;
+
+  const productIds = [...new Set(items.map(i => i.product_id).filter(Boolean))];
+  if (!productIds.length) return costs;
+
+  const tx = db.transaction(() => {
+    const ph = productIds.map(() => '?').join(',');
+    const recipeRows = db.prepare(`SELECT product_id, ingredient_id, amount FROM recipes WHERE product_id IN (${ph})`).all(...productIds);
+    const recipeMap = {};
+    for (const r of recipeRows) (recipeMap[r.product_id] = recipeMap[r.product_id] || []).push({ ingredient_id: r.ingredient_id, amount: Number(r.amount) });
+
+    const totalNeeded = {};
+    for (const item of items) {
+      const pid = item.product_id, qty = Number(item.quantity || 1);
+      if (!pid || !recipeMap[pid]) continue;
+      for (const rcp of recipeMap[pid]) totalNeeded[rcp.ingredient_id] = (totalNeeded[rcp.ingredient_id] || 0) + rcp.amount * qty;
+    }
+    if (!Object.keys(totalNeeded).length) return;
+
+    const iids = Object.keys(totalNeeded);
+    const iPh = iids.map(() => '?').join(',');
+    const ingRows = db.prepare(`SELECT id, stock, cost_per_unit, min_stock FROM ingredients WHERE id IN (${iPh})`).all(...iids);
+    const ingMap = {};
+    for (const ing of ingRows) ingMap[ing.id] = { stock: Number(ing.stock), cost_per_unit: Number(ing.cost_per_unit || 0), min_stock: Number(ing.min_stock || 0) };
+
+    for (const [iid, needed] of Object.entries(totalNeeded)) {
+      const avail = ingMap[iid] ? ingMap[iid].stock : 0;
+      if (needed > avail + 0.0001) {
+        errorResponse('insufficient_stock', 409, { error: 'insufficient_stock', ingredient_id: iid, needed: Math.round(needed * 1000) / 1000, available: Math.round(avail * 1000) / 1000 });
+      }
+    }
+
+    const affectedIngIds = new Set(), affectedProdIds = new Set(), logRows = [];
+    items.forEach((item, idx) => {
+      const pid = item.product_id, qty = Number(item.quantity || 1);
+      if (!pid || !recipeMap[pid]) return;
+      let cost = 0;
+      for (const rcp of recipeMap[pid]) {
+        const iid = rcp.ingredient_id, needed = rcp.amount * qty;
+        if (!ingMap[iid]) continue;
+        cost += needed * ingMap[iid].cost_per_unit;
+        const before = ingMap[iid].stock;
+        const after = Math.max(0, before - needed);
+        ingMap[iid].stock = after;
+        affectedIngIds.add(iid);
+        logRows.push({ iid, before, change: -needed, after });
+      }
+      costs[idx] = Math.round(cost * 10000) / 10000;
+      affectedProdIds.add(pid);
+    });
+
+    const upd = db.prepare('UPDATE ingredients SET stock=?, updated_at=datetime(\'now\') WHERE id=?');
+    for (const iid of affectedIngIds) upd.run(ingMap[iid].stock, iid);
+    const log = db.prepare(`INSERT INTO stock_logs (id,restaurant_id,ingredient_id,order_id,change_type,qty_before,qty_change,qty_after) VALUES (?,?,?,?,'deduct',?,?,?)`);
+    for (const lg of logRows) log.run(uuid(), rid, lg.iid, orderId, lg.before, lg.change, lg.after);
+
+    refreshProductAvailability([...affectedProdIds], ingMap);
+  });
+  tx();
+  return costs;
+}
+
+function restoreRecipeStock(rid, orderItems, orderId = null) {
+  if (!orderItems || !orderItems.length || !rid) return;
+  const db = getDB();
+  const s = db.prepare('SELECT recipe_stock_enabled FROM settings WHERE restaurant_id=?').get(rid);
+  if (!s || Number(s.recipe_stock_enabled) !== 1) return;
+
+  const productIds = [...new Set(orderItems.map(i => i.product_id).filter(Boolean))];
+  if (!productIds.length) return;
+
+  const tx = db.transaction(() => {
+    const ph = productIds.map(() => '?').join(',');
+    const recipeRows = db.prepare(`SELECT product_id, ingredient_id, amount FROM recipes WHERE product_id IN (${ph})`).all(...productIds);
+    const recipeMap = {};
+    for (const r of recipeRows) (recipeMap[r.product_id] = recipeMap[r.product_id] || []).push({ ingredient_id: r.ingredient_id, amount: Number(r.amount) });
+
+    const neededIngIds = new Set();
+    for (const pid of productIds) if (recipeMap[pid]) for (const rcp of recipeMap[pid]) neededIngIds.add(rcp.ingredient_id);
+    if (!neededIngIds.size) return;
+
+    const iids = [...neededIngIds];
+    const iPh = iids.map(() => '?').join(',');
+    const ingRows = db.prepare(`SELECT id, stock, min_stock FROM ingredients WHERE id IN (${iPh})`).all(...iids);
+    const ingMap = {};
+    for (const ing of ingRows) ingMap[ing.id] = { stock: Number(ing.stock), min_stock: Number(ing.min_stock || 0) };
+
+    const affectedProdIds = new Set(), logRows = [];
+    for (const item of orderItems) {
+      const pid = item.product_id, qty = Number(item.quantity || 1);
+      if (!pid || !recipeMap[pid]) continue;
+      for (const rcp of recipeMap[pid]) {
+        const iid = rcp.ingredient_id, restore = rcp.amount * qty;
+        if (!ingMap[iid]) continue;
+        const before = ingMap[iid].stock;
+        ingMap[iid].stock = before + restore;
+        logRows.push({ iid, before, change: restore, after: ingMap[iid].stock });
+      }
+      affectedProdIds.add(pid);
+    }
+
+    const upd = db.prepare('UPDATE ingredients SET stock=?, updated_at=datetime(\'now\') WHERE id=?');
+    for (const iid of neededIngIds) if (ingMap[iid]) upd.run(ingMap[iid].stock, iid);
+    const log = db.prepare(`INSERT INTO stock_logs (id,restaurant_id,ingredient_id,order_id,change_type,qty_before,qty_change,qty_after,note) VALUES (?,?,?,?,'restore',?,?,?,?)`);
+    for (const lg of logRows) log.run(uuid(), rid, lg.iid, orderId, lg.before, lg.change, lg.after, 'Sipariş iptal/silme');
+
+    refreshProductAvailability([...affectedProdIds], ingMap);
+  });
+  tx();
+}
+
+// ── basit ürün stoku (recipesiz, products.stock) düşme yardımcı ──
+function deductSimpleProductStock(rid, items) {
+  const db = getDB();
+  const stRow = db.prepare('SELECT stock_enabled FROM settings WHERE restaurant_id=?').get(rid);
+  if (!stRow || Number(stRow.stock_enabled) !== 1) return;
+  for (const item of items) {
+    const pid = item.product_id, qty = Number(item.quantity || 1);
+    if (!pid) continue;
+    const prod = db.prepare('SELECT stock FROM products WHERE id=?').get(pid);
+    if (prod && prod.stock !== null && prod.stock !== undefined) {
+      const before = Number(prod.stock);
+      const newStock = Math.max(0, before - qty);
+      db.prepare('UPDATE products SET stock=?, is_available=? WHERE id=?').run(newStock, newStock > 0 ? 1 : 0, pid);
+    }
+  }
+}
+
+// ── app_config (local cihaz ayarları: server_url, restaurant_id, device vs) ──
+function cfgGet(key) {
+  const db = getDB();
+  const row = db.prepare('SELECT value FROM app_config WHERE key=?').get(key);
+  return row ? row.value : null;
+}
+function cfgSet(key, value) {
+  const db = getDB();
+  db.prepare('INSERT INTO app_config (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value == null ? null : String(value));
+}
+
+module.exports = {
+  uuid, nowSql, toMysqlDate, restaurantTz, ApiError, errorResponse,
+  getAuthUser, requireAuth, requireAuthActive, requireSuperadmin, getMyRestaurantId,
+  assertOwnsRow, assertOwnsRestaurant, resolveEntityId, resolveUserPermissions, publishEvent,
+  getRestaurantVat, isDeliveryTable, getOrderVat, computeTotals, computeOrderTotalFromItems, checkRestaurantOpen,
+  checkRecipeStockSufficiency, checkProductStockSufficiency,
+  deductRecipeStock, restoreRecipeStock, refreshProductAvailability, deductSimpleProductStock,
+  cfgGet, cfgSet, bcrypt,
+};
