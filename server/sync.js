@@ -540,6 +540,12 @@ async function pushQueue() {
           if (item.entity_id) blockedEntities.add(ekey(item));
           continue;
         }
+        // Sunucu ödenmiş siparişi DONDURUR (mali kural). Bu kayda giden bir güncelleme
+        // asla kabul edilmeyecek; hata listesini doldurmak yerine düşürüyoruz.
+        if (result.status === 400 && item.entity_table === 'orders' && /Ödenmiş sipariş/i.test(String(result.text || ''))) {
+          console.log('[sync] ödenmiş siparişe güncelleme sunucuda kilitli — atlandı:', ekey(item));
+          markSynced(item.id); continue;
+        }
         if (result.status >= 400 && result.status < 500) {
           // Onarım denemeleri de tutmadıysa kalıcı iş kuralı hatasıdır. Sessizce
           // "başarılı" saymak veri kaybıdır → ölü-mektup kutusuna al ve AYNI
@@ -1122,7 +1128,8 @@ function applyOrders(db, orders, opts = {}) {
       if (blocked.orders && blocked.orders.has(localOrderId)) continue; // local sürüm henüz gönderilmedi
       const localOrderRow = db.prepare('SELECT * FROM orders WHERE id=?').get(localOrderId);
       const og = guardRegression(db, 'orders', o, localOrderRow);
-      if (og.regressed) requeueLocalAhead('orders', { ...localOrderRow, id: localOrderId });
+      // Sunucuda ödenmiş sipariş kilitli: geri göndermeyi denemeyiz (400 alır)
+      if (og.regressed && !Number(o.is_paid)) requeueLocalAhead('orders', { ...localOrderRow, id: localOrderId });
       const orderChanged = upsertRow(db, 'orders', og.row);
       let itemsChanged = false;
 
