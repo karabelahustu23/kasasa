@@ -391,7 +391,9 @@ async function pushQueue() {
 
     // Bir siparişin kendisi gönderilemediyse, o siparişin kalemleri/iadeleri de
     // gönderilmemeli (sunucuda henüz olmayan bir siparişe kalem eklenemez).
-    const blockedOrders = new Set();
+    const blockedOrders = new Set(
+      db.prepare(`SELECT entity_id FROM sync_queue WHERE status='failed' AND entity_table='orders'
+                    AND method='POST' AND entity_id IS NOT NULL`).all().map(r => r.entity_id));
     const referencesBlockedOrder = (it) => {
       if (!blockedOrders.size) return false;
       const hay = `${it.path || ''} ${it.body || ''}`;
@@ -401,7 +403,11 @@ async function pushQueue() {
 
     for (const item of items) {
       if (item.entity_id && blockedEntities.has(ekey(item))) continue;
-      if (referencesBlockedOrder(item)) continue;
+      if (referencesBlockedOrder(item)) {
+        if (Number(item.attempts || 0) >= MAX_ATTEMPTS - 1) markFailed(item.id, 'Bağlı sipariş gönderilemedi');
+        else backoff(item, 'bağlı sipariş henüz gönderilemedi');
+        continue;
+      }
 
       // (d) Aynı kaydın daha yeni bir güncellemesi kuyrukta varsa bunu atla.
       if (supersededByNewer(item)) { markSynced(item.id); continue; }
@@ -770,6 +776,12 @@ function toRemoteRequest(item) {
     if (rid !== item.entity_id) out.path = pathWithId(out.path, rid);
   }
   // yoldaki order_id parametresi (ör. DELETE order_items&order_id=..)
+  const tm = /[?&]table_id=([^&]+)/.exec(out.path || '');
+  if (tm) {
+    const lt = decodeURIComponent(tm[1]);
+    const rt = remoteIdFor('tables', lt);
+    if (rt !== lt) out.path = out.path.replace(/([?&]table_id=)[^&]*/, `$1${encodeURIComponent(rt)}`);
+  }
   const om = /[?&]order_id=([^&]+)/.exec(out.path || '');
   if (om) {
     const localOid = decodeURIComponent(om[1]);
@@ -783,6 +795,7 @@ function toRemoteRequest(item) {
         if (!obj || typeof obj !== 'object') return obj;
         if (obj.id && item.entity_table) obj.id = remoteIdFor(item.entity_table, obj.id);
         if (obj.order_id) obj.order_id = remoteIdFor('orders', obj.order_id);
+        if (obj.table_id) obj.table_id = remoteIdFor('tables', obj.table_id);
         if (Array.isArray(obj.order_items)) obj.order_items = obj.order_items.map(i => {
           const c = { ...i };
           if (c.id) c.id = remoteIdFor('order_items', c.id);
@@ -802,13 +815,30 @@ function learnFromResponse(item, data) {
   if (!data || typeof data !== 'object') return;
   const t = item.entity_table;
   if (Array.isArray(data)) {
-    // order_items dizi yanıtı: sırayla eşle
     let locals = [];
     try {
       const b = JSON.parse(item.body || '[]');
-      locals = Array.isArray(b) ? b : [b];
+      locals = Array.isArray(b) ? b : (Array.isArray(b && b.rows) ? b.rows : (Array.isArray(b && b.tables) ? b.tables : [b]));
     } catch (e) {}
-    data.forEach((r, i) => { if (r && r.id && locals[i] && locals[i].id) learnId(t, locals[i].id, r.id); });
+    // DİKKAT: Dizi yanıtı her zaman "eklenen satırlar" DEĞİLDİR. Örn. tables POST
+    // tablonun TAMAMINI (number'a göre sıralı) döndürür. Eskiden sırayla (index)
+    // eşleniyordu → yeni eklenen masa, Masa 1'in id'sine eşleniyordu; sonraki
+    // pull'da Masa 1 yeni masanın üstüne yazılıp asıl Masa 1 local'den siliniyordu.
+    // Artık önce id ile, masalar için içerikle (number+label+is_takeaway) eşliyoruz;
+    // index eşlemesi yalnızca uzunluklar birebir tutan order_items için.
+    const remoteIds = new Set(data.map(r => r && r.id).filter(Boolean));
+    for (let i = 0; i < locals.length; i++) {
+      const l = locals[i];
+      if (!l || !l.id) continue;
+      if (remoteIds.has(l.id)) { learnId(t, l.id, l.id); continue; }
+      if (t === 'tables') {
+        const hit = data.find(r => r && r.id && Number(r.number) === Number(l.number) &&
+          String(r.label || '') === String(l.label || '') && !!Number(r.is_takeaway || 0) === !!Number(l.is_takeaway || 0));
+        if (hit) learnId(t, l.id, hit.id);
+      } else if (t === 'order_items' && data.length === locals.length && data[i] && data[i].id) {
+        learnId(t, l.id, data[i].id);
+      }
+    }
     return;
   }
   if (data.id && item.entity_id) learnId(t, item.entity_id, data.id);
@@ -974,12 +1004,33 @@ function guardRegression(db, table, row, localRow) {
     if (localOn && !remoteOn) { out[f] = 1; regressed = true; }
   }
 
+  // ── ANA BİLGİSAYAR OTORİTESİ ──
+  // Tüm fişler bu bilgisayardan basıldığı için mutfak akışının (bekliyor /
+  // hazırlanıyor / hazır / servis) tek doğru kaynağı BURASIDIR. Uzak taraf
+  // mevcut bir siparişin mutfak durumunu ileri de geri de değiştiremez;
+  // fark varsa local hâl sunucuya geri gönderilir. Yalnızca "kapanış"
+  // durumları (tamamlandı/ödendi/iptal) uzaktan kabul edilir (siteden ödeme,
+  // gün kapatma vb.).
   if (table === 'orders' && out.status !== undefined) {
-    const rRank = rankOf(out.status), lRank = rankOf(localRow.status);
-    // Tanımadığımız bir durum varsa karışmıyoruz — uzak taraf haklı sayılır.
-    if (rRank !== null && lRank !== null && rRank < lRank) {
+    const TERMINAL = new Set(['completed', 'paid', 'cancelled', 'canceled']);
+    const rs = String(out.status || '').toLowerCase();
+    const ls = String(localRow.status || '').toLowerCase();
+    if (rs !== ls && !TERMINAL.has(rs) && !TERMINAL.has(ls)) {
+      out.status = localRow.status;
+      if ('ready_at' in out) out.ready_at = localRow.ready_at;
+      if ('served_at' in out) out.served_at = localRow.served_at;
+      regressed = true;
+    } else if (TERMINAL.has(ls) && !TERMINAL.has(rs)) {
+      // Local kapattı, uzak hâlâ açık görüyor → local kazanır (geri açılmaz)
       out.status = localRow.status;
       regressed = true;
+    }
+  }
+  if (table === 'order_items') {
+    for (const f of ['sent_to_kitchen', 'is_ready']) {
+      if (!(f in out)) continue;
+      const r = Number(out[f] === true ? 1 : out[f] || 0), l = Number(localRow[f] || 0);
+      if (r !== l) { out[f] = l; regressed = true; }
     }
   }
   return { row: out, regressed };
@@ -1006,6 +1057,31 @@ function requeueLocalAhead(table, row) {
     });
     console.log(`[sync] ${table}#${row.id}: local durum sunucudan ileride — fark tekrar kuyruğa alındı`);
   } catch (e) { console.warn('[sync] requeue hatası:', e.message); }
+}
+
+// Açık (ödenmemiş, iptal edilmemiş, kapanmamış) siparişi olan ama "empty"
+// görünen masaları "occupied" yapar ve sunucuya bildirir. Örnek: kasada masa
+// çevrimdışı kapatıldı, aynı anda müşteri QR'dan yeni sipariş verdi; ya da gün
+// kapatma tüm masaları boşalttı ama bir masada ödenmemiş sipariş vardı.
+function healTableStatuses() {
+  try {
+    const db = getDB();
+    const rows = db.prepare(`
+      SELECT t.id FROM tables t
+       WHERE COALESCE(t.status,'empty')='empty'
+         AND EXISTS (SELECT 1 FROM orders o
+                      WHERE o.table_id=t.id AND COALESCE(o.is_paid,0)=0 AND o.voided_at IS NULL
+                        AND COALESCE(o.status,'pending') NOT IN ('completed','paid','cancelled','canceled'))`).all();
+    for (const r of rows) {
+      db.prepare(`UPDATE tables SET status='occupied', opened_at=COALESCE(opened_at, datetime('now')) WHERE id=?`).run(r.id);
+      // Sunucuya GÖNDERMİYORUZ: kuyrukta bekleyen eski bir "dolu" isteği, bu
+      // arada sitede kapanan masayı yeniden dolu yapabilir. Sunucu kendi
+      // siparişine göre masayı zaten dolu işaretliyor; burada yalnızca bu
+      // bilgisayarın ekranı doğru tutuluyor.
+    }
+    if (rows.length) console.log(`[sync] açık siparişi olan ${rows.length} masa "dolu" yapıldı`);
+    return rows.length;
+  } catch (e) { console.warn('[sync] masa iyileştirme hatası:', e.message); return 0; }
 }
 
 function applyOrders(db, orders, opts = {}) {
@@ -1035,6 +1111,7 @@ function applyOrders(db, orders, opts = {}) {
       const remoteOrderId = o.id;
       const localOrderId = localIdFor('orders', remoteOrderId);
       o.id = localOrderId;
+      if (o.table_id) o.table_id = localIdFor('tables', o.table_id);
 
       // ÖNEMLİ: Uzaktan gelen her sipariş için de eşleme/onay kaydı yazıyoruz.
       // Aksi halde SİTEDE oluşturulmuş siparişlerin "sunucu bunu biliyor" kaydı
@@ -1179,9 +1256,15 @@ async function pullRemoteUpdates({ force = false } = {}) {
     const localRows = scoped
       ? db.prepare(`SELECT id FROM "${t}" WHERE restaurant_id=?`).all(rid)
       : db.prepare(`SELECT id FROM "${t}"`).all();
+    // Toplu eklemeler ({rows:[...]}) kuyruğa entity_id'siz düşer; bunlar
+    // gönderilene kadar gövdelerinde geçen id'ler de silinmez (sonradan eklenen
+    // masaların senkronda kaybolması).
+    const pendingBodies = db.prepare(
+      `SELECT body FROM sync_queue WHERE status IN ('pending','failed') AND entity_table=? AND entity_id IS NULL`
+    ).all(t).map(r => r.body || '').join('\n');
     const doomed = localRows
       .map(r => r.id)
-      .filter(id => !remoteIds.has(id) && !(blocked[t] && blocked[t].has(id)));
+      .filter(id => !remoteIds.has(id) && !(blocked[t] && blocked[t].has(id)) && !pendingBodies.includes(id));
     if (!doomed.length) return 0;
     const del = db.prepare(`DELETE FROM "${t}" WHERE id=?`);
     const delMap = db.prepare('DELETE FROM id_map WHERE entity_table=? AND local_id=?');
@@ -1193,6 +1276,7 @@ async function pullRemoteUpdates({ force = false } = {}) {
 
   const applyList = (t, rows, { full = false } = {}) => {
     const list = Array.isArray(rows) ? rows : (rows && rows.id ? [rows] : []);
+    Object.assign(blocked, pendingEntityIds()); // fetch sırasında gelen yeni local yazmalar
     // Boş liste de anlamlıdır: uzakta hiç kayıt kalmamış olabilir. Sadece istek
     // GERÇEKTEN başarılı olduysa (get() hata fırlatmadıysa) buraya geliyoruz.
     if (!list.length && !(full && Array.isArray(rows))) return 0;
@@ -1240,6 +1324,9 @@ async function pullRemoteUpdates({ force = false } = {}) {
       if (Array.isArray(orders)) {
         if (deep) H.cfgSet('last_deep_reconcile', String(Date.now()));
         if (orders.length) {
+          // Ağ isteği sürerken kasada yapılan yeni yazmalar da korunmalı:
+          // korumayı istek BİTTİKTEN sonra tazeliyoruz.
+          Object.assign(blocked, pendingEntityIds());
           const n = applyOrders(db, orders, { blocked });
           if (n) { pulled += n; touched.add('orders'); }
         }
@@ -1368,6 +1455,7 @@ async function pullRemoteUpdates({ force = false } = {}) {
       H.cfgSet('last_catalog_sync', String(Date.now()));
     }
 
+    if (healTableStatuses()) touched.add('tables');
     H.cfgSet('last_incremental_sync', new Date().toISOString());
     state.online = true;
     state.lastPullAt = new Date().toISOString();
@@ -1609,7 +1697,7 @@ async function diagnose() {
   return out;
 }
 
-module.exports = {
+module.exports = { healTableStatuses,
   diagnose,
   pullInitialData, remoteLoginAndBootstrap,
   queueWrite, queueUpload, pushQueue, pendingCount,
