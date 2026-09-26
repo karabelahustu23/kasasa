@@ -149,10 +149,14 @@ function registerPrintHandlers() {
         html, body { margin:0; padding:0; width:${mm}mm; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
       </style></head><body>${html}</body></html>`;
 
-    const printWin = new BrowserWindow({ show: false, webPreferences: { offscreen: true } });
+    // offscreen:true ile yazdırma Windows'ta zaman zaman BOŞ/HİÇ çıkmayan fişe yol
+    // açıyor; normal gizli pencere kullanılıyor. Yazıcı cevap vermezse (kapalı/uykuda)
+    // callback hiç gelmiyordu → fiş sessizce kayboluyordu; 20 sn zaman aşımı eklendi.
+    const printWin = new BrowserWindow({ show: false, webPreferences: { backgroundThrottling: false } });
     try {
       await printWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(doc));
       const result = await new Promise((resolve) => {
+        const to = setTimeout(() => resolve({ ok: false, error: 'timeout' }), 20000);
         printWin.webContents.print(
           {
             silent: true,
@@ -161,9 +165,12 @@ function registerPrintHandlers() {
             margins: { marginType: 'none' },
             pageSize: { width: mm * 1000, height: 297000 },
           },
-          (success, errorType) => resolve({ ok: success, error: success ? null : errorType })
+          (success, errorType) => { clearTimeout(to); resolve({ ok: success, error: success ? null : errorType }); }
         );
       });
+      // Pencereyi hemen yok etmek, bazı sürücülerde işi yazıcı kuyruğuna
+      // ulaşmadan kesebiliyor; kısa bekleme.
+      await new Promise(r => setTimeout(r, 500));
       return result;
     } catch (e) {
       return { ok: false, error: String(e.message || e) };
