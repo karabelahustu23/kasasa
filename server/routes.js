@@ -530,8 +530,9 @@ router.all('/api/index.php', wrap((req, res) => {
     if (method === 'POST' && action === 'close_day') {
       const user = H.requireAuthActive(req);
       const rid = H.getMyRestaurantId(user);
-      db.prepare(`UPDATE orders SET status='completed' WHERE restaurant_id=? AND status NOT IN ('completed')`).run(rid);
-      db.prepare(`UPDATE tables SET status='empty' WHERE restaurant_id=? AND status!='empty'`).run(rid);
+      db.prepare(`UPDATE orders SET status='completed' WHERE restaurant_id=? AND status NOT IN ('completed') AND is_paid=1`).run(rid);
+      db.prepare(`UPDATE tables SET status='empty' WHERE restaurant_id=? AND status!='empty'
+                  AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.table_id=tables.id AND COALESCE(o.is_paid,0)=0 AND o.voided_at IS NULL AND o.status NOT IN ('completed','cancelled'))`).run(rid);
       db.prepare(`UPDATE settings SET is_day_closed=1, last_closed_at=? WHERE restaurant_id=?`).run(H.nowSql(), rid);
       return j(res, { success: true });
     }
@@ -601,7 +602,7 @@ router.all('/api/index.php', wrap((req, res) => {
       const vatInfo = H.getOrderVat(rid, body.table_id);
       let finalTotal, vatAmt;
       if (body.order_items && body.order_items.length) {
-        const calcP = H.computeTotals(rid, body.table_id, body.order_items, discountAmt);
+        const calcP = H.computeTotals(rid, body.table_id, body.order_items, discountAmt, body.delivery_company);
         vatAmt = calcP.vat_amount;
         finalTotal = calcP.total;
       } else {
