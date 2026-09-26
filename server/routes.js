@@ -25,6 +25,9 @@ function wrap(fn) {
       if (res.statusCode < 400) {
         // Başarılı yazma: offline-sync kuyruğuna ekle + arayüzlere anlık olay yayınla
         enqueueIfWrite(req, captured);
+        if (['orders', 'order_items', 'settings'].includes(req.query.table) && req.method !== 'GET') {
+          try { require('./printjobs').schedule(); } catch (e) {}
+        }
         if (['orders', 'tables', 'order_items'].includes(req.query.table) && req.method !== 'GET') {
           try { if (require('./sync').healTableStatuses()) E.publish && req.query.restaurant_id && E.publish(req.query.restaurant_id, 'table_update', {}); } catch (e) {}
         }
@@ -52,7 +55,7 @@ function parseJsonField(v, def) {
 
 // Bu tablolar tamamen cihaza özeldir / online tarafta karşılığı yoktur —
 // kuyruğa hiç girmezler.
-const NO_SYNC_TABLES = ['auth', 'upload', 'events_ping', 'events_wait', 'realtime', 'sync'];
+const NO_SYNC_TABLES = ['auth', 'upload', 'events_ping', 'events_wait', 'realtime', 'sync', 'kitchen_print_claim', 'print_jobs'];
 
 // Yazma isteklerini (POST/PUT/DELETE), yanıt üretildikten sonra local'de zaten
 // uygulanmış olarak kabul edip offline-sync kuyruğuna ekler (idempotent).
@@ -551,6 +554,7 @@ router.all('/api/index.php', wrap((req, res) => {
       const params = [rid];
       if (req.query.status) { const statuses = req.query.status.split(',').map(s => s.trim()); sql += ` AND status IN (${statuses.map(() => '?').join(',')})`; params.push(...statuses); }
       if (req.query.table_id !== undefined) { sql += ' AND table_id=?'; params.push(req.query.table_id); }
+      if (req.query.is_paid !== undefined) { sql += ' AND COALESCE(is_paid,0)=?'; params.push(Number(req.query.is_paid) ? 1 : 0); }
       if (req.query.date_from) { sql += ' AND created_at>=?'; params.push(req.query.date_from); }
       if (req.query.date_to) { sql += ' AND created_at<=?'; params.push(req.query.date_to); }
       const allowedFilterCols = ['id', 'created_at', 'updated_at', 'total', 'status', 'is_paid', 'ready_at', 'served_at', 'paid_at', 'discount_amount'];
@@ -637,8 +641,15 @@ router.all('/api/index.php', wrap((req, res) => {
       const existing = H.assertOwnsRow('orders', id, user);
       const wasPaid = Number(existing.is_paid) === 1;
       if (wasPaid) {
-        const onlyReprint = Object.keys(body).every(k => k === 'receipt_printed_at');
-        if (!onlyReprint) H.errorResponse('Ödenmiş sipariş kaydı değiştirilemez. Düzeltme gerekiyorsa iade/iptal kaydı oluşturun.', 400);
+        // Mali alanlar donuk kalır; ama durum (hazırlanıyor/hazır/servis/tamamlandı)
+        // ve fiş damgası değişebilir. Eskiden ÖN ÖDEMELİ sipariş mutfakta
+        // "Hazırlanıyor" yapılamıyor, masadan da hiç kapatılamıyordu.
+        // Değeri aynı gelen alanlar (ör. senkronun tekrar gönderdiği is_paid=1) sorun sayılmaz.
+        const NON_FIN = ['receipt_printed_at', 'status', 'ready_at', 'served_at'];
+        const changed = Object.keys(body).filter(k => String(body[k] ?? '') !== String(existing[k] ?? '') && !(k === 'is_paid' && Number(body[k]) === 1));
+        if (changed.some(k => !NON_FIN.includes(k))) H.errorResponse('Ödenmiş sipariş kaydı değiştirilemez. Düzeltme gerekiyorsa iade/iptal kaydı oluşturun.', 400);
+        for (const k of Object.keys(body)) if (!NON_FIN.includes(k)) delete body[k];
+        if (!Object.keys(body).length) return j(res, existing);
       }
       const fields = [], values = [];
       for (const f of ['status', 'total', 'note', 'is_paid', 'table_id', 'ready_at', 'served_at', 'payment_method', 'discount_amount', 'paid_at', 'bank_name', 'delivery_company', 'receipt_printed_at']) {
@@ -700,11 +711,49 @@ router.all('/api/index.php', wrap((req, res) => {
   }
 
   // ── ORDER_REFUNDS ─────────────────────────────────────
+  // ── MUTFAK FİŞİ KİLİDİ ── Aynı kalem için ikinci fişi engeller (birden fazla
+  // pencere/ekran açıkken veya yenilemede). Atomik: yalnızca ilk soran onay alır.
+  // ── MUTFAK FİŞ KUYRUĞU ── (yalnızca bu bilgisayar; senkronlanmaz)
+  if (table === 'print_jobs') {
+    const PJ = require('./printjobs');
+    H.requireAuthActive(req);
+    const action = req.query.action || '';
+    if (method === 'GET') {
+      if (req.query.status === 'pending') return j(res, PJ.listPending());
+      if (action === 'counts') return j(res, PJ.counts());
+      return j(res, PJ.listRecent(req.query.limit));
+    }
+    if (method === 'POST' && action === 'claim') return j(res, PJ.claim(body.id) || null);
+    if (method === 'POST' && action === 'reprint') { const nid = PJ.reprint(body.id); if (!nid) H.errorResponse('Fiş bulunamadı', 404); return j(res, { id: nid }); }
+    if (method === 'POST' && action === 'dismiss') { PJ.dismiss(body.id); return j(res, { success: true }); }
+    if (method === 'POST' && action === 'generate') return j(res, { created: PJ.generate() });
+    if (method === 'PUT' && req.query.id) {
+      if (body.status === 'printed') PJ.markPrinted(req.query.id);
+      else PJ.markFailed(req.query.id, body.error);
+      return j(res, { success: true });
+    }
+    H.errorResponse('Geçersiz istek');
+  }
+
+  if (table === 'kitchen_print_claim') {
+    if (method !== 'POST') H.errorResponse('Method not allowed', 405);
+    const user = H.requireAuthActive(req);
+    const ids = [...new Set((Array.isArray(body.item_ids) ? body.item_ids : []).filter(x => typeof x === 'string'))].slice(0, 200);
+    const st = db.prepare(`UPDATE order_items SET kitchen_printed_at=datetime('now') WHERE id=? AND kitchen_printed_at IS NULL`);
+    const claimed = [];
+    db.transaction(() => { for (const id of ids) if (st.run(id).changes > 0) claimed.push(id); })();
+    return j(res, { claimed });
+  }
+
   if (table === 'order_refunds') {
     if (method === 'GET') {
       const user = H.requireAuthActive(req);
       const rid = H.assertOwnsRestaurant(req.query.restaurant_id || null, user);
-      return j(res, db.prepare('SELECT * FROM order_refunds WHERE restaurant_id=? ORDER BY created_at DESC').all(rid));
+      let sql = 'SELECT * FROM order_refunds WHERE restaurant_id=?'; const ps = [rid];
+      if (req.query.order_id) { sql += ' AND order_id=?'; ps.push(req.query.order_id); }
+      if (req.query.gt_created_at) { sql += ' AND created_at>?'; ps.push(H.toMysqlDate(req.query.gt_created_at)); }
+      if (req.query.lte_created_at) { sql += ' AND created_at<=?'; ps.push(H.toMysqlDate(req.query.lte_created_at)); }
+      return j(res, db.prepare(sql + ' ORDER BY created_at DESC').all(...ps));
     }
     if (method === 'POST') {
       const user = H.requireAuthActive(req);
